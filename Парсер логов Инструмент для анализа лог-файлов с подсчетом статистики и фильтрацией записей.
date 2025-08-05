@@ -1,0 +1,59 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+)
+
+type LogEntry struct {
+	Timestamp time.Time
+	Level     string
+	Message   string
+	IP        string
+	Method    string
+	Path      string
+	Status    int
+	Size      int
+}
+
+type LogStats struct {
+	TotalLines    int
+	ErrorCount    int
+	WarningCount  int
+	InfoCount     int
+	IPStats       map[string]int
+	StatusStats   map[int]int
+	MethodStats   map[string]int
+	PathStats     map[string]int
+	HourlyStats   map[int]int
+}
+
+type LogParser struct {
+	filename    string
+	entries     []LogEntry
+	stats       LogStats
+	patterns    map[string]*regexp.Regexp
+}
+
+func NewLogParser(filename string) *LogParser {
+	return &LogParser{
+		filename: filename,
+		entries:  []LogEntry{},
+		stats: LogStats{
+			IPStats:     make(map[string]int),
+			StatusStats: make(map[int]int),
+			MethodStats: make(map[string]int),
+			PathStats:   make(map[string]int),
+			HourlyStats: make(map[int]int),
+		},
+		patterns: map[string]*regexp.Regexp{
+			// Apache/Nginx access log pattern
+			"access": regexp.MustCompile(`^(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) ([^\s"]+).*?" (\d+) (\d+|-)`),
+			// Application log pattern
+			"app": regexp.MustCompile(`^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(\w+)\] (.+)$`),
+			//
