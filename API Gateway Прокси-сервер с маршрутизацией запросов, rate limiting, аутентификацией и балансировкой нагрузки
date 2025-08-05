@@ -1,0 +1,1482 @@
+// cmd/main.go
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
+	"apigateway/internal/auth"
+	"apigateway/internal/balancer"
+	"apigateway/internal/config"
+	"apigateway/internal/middleware"
+	"apigateway/internal/proxy"
+	"apigateway/internal/ratelimit"
+	"apigateway/internal/registry"
+)
+
+func main() {
+	// Load environment variables
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found")
+	}
+
+	cfg := config.Load()
+
+	// Initialize components
+	serviceRegistry := registry.New()
+	rateLimiter := ratelimit.New(cfg.RateLimit)
+	authenticator := auth.New(cfg.Auth)
+	loadBalancer := balancer.New()
+	proxyHandler := proxy.New(serviceRegistry, loadBalancer)
+
+	// Load service configurations
+	if err := serviceRegistry.LoadFromConfig(cfg.Services); err != nil {
+		log.Fatal("Failed to load services:", err)
+	}
+
+	// Setup router
+	router := gin.New()
+	
+	// Global middleware
+	router.Use(gin.Recovery())
+	router.Use(middleware.Logger())
+	router.Use(middleware.CORS())
+	router.Use(middleware.RequestID())
+	
+	// Admin routes (no rate limiting)
+	admin := router.Group("/admin")
+	admin.Use(middleware.AdminAuth(cfg.AdminToken))
+	{
+		admin.GET("/services", serviceRegistry.ListServices)
+		admin.POST("/services", serviceRegistry.RegisterService)
+		admin.PUT("/services/:id", serviceRegistry.UpdateService)
+		admin.DELETE("/services/:id", serviceRegistry.UnregisterService)
+		admin.GET("/health", healthCheck)
+		admin.GET("/metrics", getMetrics)
+	}
+
+	// Main proxy routes
+	proxy := router.Group("/")
+	proxy.Use(middleware.RateLimit(rateLimiter))
+	proxy.Use(middleware.Auth(authenticator))
+	proxy.Use(middleware.LoadBalancer(loadBalancer))
+	proxy.NoRoute(proxyHandler.Handle)
+
+	server := &http.Server{
+		Addr:           ":" + cfg.Port,
+		Handler:        router,
+		ReadTimeout:    time.Duration(cfg.ReadTimeout) * time.Second,
+		WriteTimeout:   time.Duration(cfg.WriteTimeout) * time.Second,
+		IdleTimeout:    time.Duration(cfg.IdleTimeout) * time.Second,
+		MaxHeaderBytes: cfg.MaxHeaderBytes,
+	}
+
+	// Start server
+	go func() {
+		log.Printf("API Gateway starting on port %s", cfg.Port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal("Server failed to start:", err)
+		}
+	}()
+
+	// Graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down server...")
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatal("Server forced to shutdown:", err)
+	}
+	
+	log.Println("Server exited")
+}
+
+func healthCheck(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"status":    "healthy",
+		"timestamp": time.Now(),
+		"version":   "1.0.0",
+	})
+}
+
+func getMetrics(c *gin.Context) {
+	// Return basic metrics
+	c.JSON(http.StatusOK, gin.H{
+		"requests_total":     1000,
+		"requests_per_sec":   50,
+		"active_connections": 25,
+		"uptime":            "2h30m",
+	})
+}
+
+// internal/config/config.go
+package config
+
+import (
+	"encoding/json"
+	"os"
+	"strconv"
+)
+
+type Config struct {
+	Port           string         `json:"port"`
+	AdminToken     string         `json:"adminToken"`
+	ReadTimeout    int            `json:"readTimeout"`
+	WriteTimeout   int            `json:"writeTimeout"`
+	IdleTimeout    int            `json:"idleTimeout"`
+	MaxHeaderBytes int            `json:"maxHeaderBytes"`
+	RateLimit      RateLimitConfig `json:"rateLimit"`
+	Auth           AuthConfig     `json:"auth"`
+	Services       []ServiceConfig `json:"services"`
+}
+
+type RateLimitConfig struct {
+	RequestsPerMinute int `json:"requestsPerMinute"`
+	BurstSize         int `json:"burstSize"`
+}
+
+type AuthConfig struct {
+	Enabled    bool     `json:"enabled"`
+	JWTSecret  string   `json:"jwtSecret"`
+	APIKeys    []string `json:"apiKeys"`
+	BasicAuth  bool     `json:"basicAuth"`
+}
+
+type ServiceConfig struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	PathPrefix  string   `json:"pathPrefix"`
+	Upstream    []string `json:"upstream"`
+	Strategy    string   `json:"strategy"` // round_robin, least_conn, ip_hash
+	HealthCheck string   `json:"healthCheck"`
+	Timeout     int      `json:"timeout"`
+	Retries     int      `json:"retries"`
+}
+
+func Load() *Config {
+	readTimeout, _ := strconv.Atoi(getEnv("READ_TIMEOUT", "30"))
+	writeTimeout, _ := strconv.Atoi(getEnv("WRITE_TIMEOUT", "30"))
+	idleTimeout, _ := strconv.Atoi(getEnv("IDLE_TIMEOUT", "120"))
+	maxHeaderBytes, _ := strconv.Atoi(getEnv("MAX_HEADER_BYTES", "1048576"))
+	
+	rateLimit, _ := strconv.Atoi(getEnv("RATE_LIMIT", "100"))
+	burstSize, _ := strconv.Atoi(getEnv("BURST_SIZE", "200"))
+
+	cfg := &Config{
+		Port:           getEnv("PORT", "8080"),
+		AdminToken:     getEnv("ADMIN_TOKEN", "admin-secret-token"),
+		ReadTimeout:    readTimeout,
+		WriteTimeout:   writeTimeout,
+		IdleTimeout:    idleTimeout,
+		MaxHeaderBytes: maxHeaderBytes,
+		RateLimit: RateLimitConfig{
+			RequestsPerMinute: rateLimit,
+			BurstSize:         burstSize,
+		},
+		Auth: AuthConfig{
+			Enabled:   getEnv("AUTH_ENABLED", "false") == "true",
+			JWTSecret: getEnv("JWT_SECRET", "jwt-secret-key"),
+			APIKeys:   []string{getEnv("API_KEY", "default-api-key")},
+			BasicAuth: getEnv("BASIC_AUTH", "false") == "true",
+		},
+	}
+
+	// Load services from config file or environment
+	if servicesJSON := getEnv("SERVICES_CONFIG", ""); servicesJSON != "" {
+		json.Unmarshal([]byte(servicesJSON), &cfg.Services)
+	} else {
+		cfg.Services = getDefaultServices()
+	}
+
+	return cfg
+}
+
+func getDefaultServices() []ServiceConfig {
+	return []ServiceConfig{
+		{
+			ID:          "user-service",
+			Name:        "User Service",
+			PathPrefix:  "/api/users",
+			Upstream:    []string{"http://localhost:8081", "http://localhost:8082"},
+			Strategy:    "round_robin",
+			HealthCheck: "/health",
+			Timeout:     30,
+			Retries:     3,
+		},
+		{
+			ID:         "order-service",
+			Name:       "Order Service",
+			PathPrefix: "/api/orders",
+			Upstream:   []string{"http://localhost:8083"},
+			Strategy:   "round_robin",
+			Timeout:    30,
+			Retries:    2,
+		},
+	}
+}
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// internal/models/models.go
+package models
+
+import "time"
+
+type Service struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	PathPrefix  string    `json:"pathPrefix"`
+	Upstream    []string  `json:"upstream"`
+	Strategy    string    `json:"strategy"`
+	HealthCheck string    `json:"healthCheck"`
+	Timeout     int       `json:"timeout"`
+	Retries     int       `json:"retries"`
+	Status      string    `json:"status"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
+type UpstreamServer struct {
+	URL         string    `json:"url"`
+	Status      string    `json:"status"` // healthy, unhealthy, unknown
+	LastCheck   time.Time `json:"lastCheck"`
+	Connections int       `json:"connections"`
+	Weight      int       `json:"weight"`
+}
+
+type RequestContext struct {
+	RequestID   string            `json:"requestId"`
+	Method      string            `json:"method"`
+	Path        string            `json:"path"`
+	Headers     map[string]string `json:"headers"`
+	RemoteAddr  string            `json:"remoteAddr"`
+	UserAgent   string            `json:"userAgent"`
+	StartTime   time.Time         `json:"startTime"`
+	ServiceID   string            `json:"serviceId"`
+	UpstreamURL string            `json:"upstreamUrl"`
+}
+
+// internal/registry/registry.go
+package registry
+
+import (
+	"fmt"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"apigateway/internal/config"
+	"apigateway/internal/models"
+)
+
+type Registry struct {
+	services map[string]*models.Service
+	mutex    sync.RWMutex
+}
+
+func New() *Registry {
+	return &Registry{
+		services: make(map[string]*models.Service),
+	}
+}
+
+func (r *Registry) LoadFromConfig(configs []config.ServiceConfig) error {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	for _, cfg := range configs {
+		service := &models.Service{
+			ID:          cfg.ID,
+			Name:        cfg.Name,
+			PathPrefix:  cfg.PathPrefix,
+			Upstream:    cfg.Upstream,
+			Strategy:    cfg.Strategy,
+			HealthCheck: cfg.HealthCheck,
+			Timeout:     cfg.Timeout,
+			Retries:     cfg.Retries,
+			Status:      "active",
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+		}
+		r.services[cfg.ID] = service
+	}
+
+	return nil
+}
+
+func (r *Registry) GetService(pathPrefix string) (*models.Service, error) {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	for _, service := range r.services {
+		if matchesPrefix(pathPrefix, service.PathPrefix) {
+			return service, nil
+		}
+	}
+
+	return nil, fmt.Errorf("service not found for path: %s", pathPrefix)
+}
+
+func (r *Registry) ListServices(c *gin.Context) {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	services := make([]*models.Service, 0, len(r.services))
+	for _, service := range r.services {
+		services = append(services, service)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"services": services})
+}
+
+func (r *Registry) RegisterService(c *gin.Context) {
+	var service models.Service
+	if err := c.ShouldBindJSON(&service); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	service.CreatedAt = time.Now()
+	service.UpdatedAt = time.Now()
+	service.Status = "active"
+
+	r.services[service.ID] = &service
+
+	c.JSON(http.StatusCreated, service)
+}
+
+func (r *Registry) UpdateService(c *gin.Context) {
+	id := c.Param("id")
+
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	service, exists := r.services[id]
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Service not found"})
+		return
+	}
+
+	var updatedService models.Service
+	if err := c.ShouldBindJSON(&updatedService); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	updatedService.ID = id
+	updatedService.CreatedAt = service.CreatedAt
+	updatedService.UpdatedAt = time.Now()
+
+	r.services[id] = &updatedService
+
+	c.JSON(http.StatusOK, updatedService)
+}
+
+func (r *Registry) UnregisterService(c *gin.Context) {
+	id := c.Param("id")
+
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	if _, exists := r.services[id]; !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Service not found"})
+		return
+	}
+
+	delete(r.services, id)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Service unregistered successfully"})
+}
+
+func matchesPrefix(path, prefix string) bool {
+	if len(prefix) == 0 {
+		return true
+	}
+	if len(path) < len(prefix) {
+		return false
+	}
+	return path[:len(prefix)] == prefix
+}
+
+// internal/balancer/balancer.go
+package balancer
+
+import (
+	"fmt"
+	"hash/fnv"
+	"net/url"
+	"sync"
+
+	"apigateway/internal/models"
+)
+
+type Balancer struct {
+	roundRobinCounters map[string]int
+	connectionCounts   map[string]int
+	mutex              sync.RWMutex
+}
+
+func New() *Balancer {
+	return &Balancer{
+		roundRobinCounters: make(map[string]int),
+		connectionCounts:   make(map[string]int),
+	}
+}
+
+func (b *Balancer) SelectUpstream(service *models.Service, clientIP string) (string, error) {
+	if len(service.Upstream) == 0 {
+		return "", fmt.Errorf("no upstream servers available")
+	}
+
+	switch service.Strategy {
+	case "least_conn":
+		return b.selectLeastConnection(service)
+	case "ip_hash":
+		return b.selectByIPHash(service, clientIP)
+	default: // round_robin
+		return b.selectRoundRobin(service)
+	}
+}
+
+func (b *Balancer) selectRoundRobin(service *models.Service) (string, error) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	counter := b.roundRobinCounters[service.ID]
+	selected := service.Upstream[counter%len(service.Upstream)]
+	b.roundRobinCounters[service.ID] = counter + 1
+
+	return selected, nil
+}
+
+func (b *Balancer) selectLeastConnection(service *models.Service) (string, error) {
+	b.mutex.RLock()
+	defer b.mutex.RUnlock()
+
+	var selected string
+	minConnections := int(^uint(0) >> 1) // max int
+
+	for _, upstream := range service.Upstream {
+		connections := b.connectionCounts[upstream]
+		if connections < minConnections {
+			minConnections = connections
+			selected = upstream
+		}
+	}
+
+	if selected == "" {
+		selected = service.Upstream[0]
+	}
+
+	return selected, nil
+}
+
+func (b *Balancer) selectByIPHash(service *models.Service, clientIP string) (string, error) {
+	hash := fnv.New32a()
+	hash.Write([]byte(clientIP))
+	index := int(hash.Sum32()) % len(service.Upstream)
+	return service.Upstream[index], nil
+}
+
+func (b *Balancer) IncrementConnections(upstream string) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	b.connectionCounts[upstream]++
+}
+
+func (b *Balancer) DecrementConnections(upstream string) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	if b.connectionCounts[upstream] > 0 {
+		b.connectionCounts[upstream]--
+	}
+}
+
+// internal/ratelimit/ratelimit.go
+package ratelimit
+
+import (
+	"sync"
+	"time"
+
+	"apigateway/internal/config"
+)
+
+type RateLimiter struct {
+	config  config.RateLimitConfig
+	buckets map[string]*TokenBucket
+	mutex   sync.RWMutex
+}
+
+type TokenBucket struct {
+	tokens     int
+	capacity   int
+	refillRate int
+	lastRefill time.Time
+	mutex      sync.Mutex
+}
+
+func New(config config.RateLimitConfig) *RateLimiter {
+	return &RateLimiter{
+		config:  config,
+		buckets: make(map[string]*TokenBucket),
+	}
+}
+
+func (rl *RateLimiter) Allow(clientID string) bool {
+	rl.mutex.Lock()
+	bucket, exists := rl.buckets[clientID]
+	if !exists {
+		bucket = &TokenBucket{
+			tokens:     rl.config.BurstSize,
+			capacity:   rl.config.BurstSize,
+			refillRate: rl.config.RequestsPerMinute,
+			lastRefill: time.Now(),
+		}
+		rl.buckets[clientID] = bucket
+	}
+	rl.mutex.Unlock()
+
+	return bucket.TakeToken()
+}
+
+func (tb *TokenBucket) TakeToken() bool {
+	tb.mutex.Lock()
+	defer tb.mutex.Unlock()
+
+	now := time.Now()
+	elapsed := now.Sub(tb.lastRefill)
+	
+	// Refill tokens based on elapsed time
+	tokensToAdd := int(elapsed.Minutes() * float64(tb.refillRate))
+	tb.tokens += tokensToAdd
+	
+	if tb.tokens > tb.capacity {
+		tb.tokens = tb.capacity
+	}
+	
+	tb.lastRefill = now
+
+	if tb.tokens > 0 {
+		tb.tokens--
+		return true
+	}
+	
+	return false
+}
+
+// internal/auth/auth.go
+package auth
+
+import (
+	"crypto/subtle"
+	"encoding/base64"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"apigateway/internal/config"
+)
+
+type Authenticator struct {
+	config config.AuthConfig
+}
+
+func New(config config.AuthConfig) *Authenticator {
+	return &Authenticator{config: config}
+}
+
+func (a *Authenticator) ValidateRequest(authHeader string) (*Claims, error) {
+	if !a.config.Enabled {
+		return &Claims{Valid: true}, nil
+	}
+
+	if authHeader == "" {
+		return nil, fmt.Errorf("authorization header required")
+	}
+
+	// Check Bearer token (JWT)
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		return a.validateJWT(token)
+	}
+
+	// Check API Key
+	if strings.HasPrefix(authHeader, "ApiKey ") {
+		apiKey := strings.TrimPrefix(authHeader, "ApiKey ")
+		return a.validateAPIKey(apiKey)
+	}
+
+	// Check Basic Auth
+	if strings.HasPrefix(authHeader, "Basic ") && a.config.BasicAuth {
+		return a.validateBasicAuth(authHeader)
+	}
+
+	return nil, fmt.Errorf("invalid authorization format")
+}
+
+func (a *Authenticator) validateJWT(tokenString string) (*Claims, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return []byte(a.config.JWTSecret), nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	if claims, ok := token.Claims.(*Claims); ok && token.Valid {
+		claims.Valid = true
+		return claims, nil
+	}
+
+	return nil, fmt.Errorf("invalid token")
+}
+
+func (a *Authenticator) validateAPIKey(apiKey string) (*Claims, error) {
+	for _, validKey := range a.config.APIKeys {
+		if subtle.ConstantTimeCompare([]byte(apiKey), []byte(validKey)) == 1 {
+			return &Claims{
+				UserID: "api-user",
+				Valid:  true,
+			}, nil
+		}
+	}
+	return nil, fmt.Errorf("invalid API key")
+}
+
+func (a *Authenticator) validateBasicAuth(authHeader string) (*Claims, error) {
+	// Simple basic auth validation (username:password = admin:secret)
+	auth := strings.TrimPrefix(authHeader, "Basic ")
+	decoded, err := base64.StdEncoding.DecodeString(auth)
+	if err != nil {
+		return nil, err
+	}
+
+	credentials := string(decoded)
+	if credentials == "admin:secret" {
+		return &Claims{
+			UserID: "admin",
+			Valid:  true,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("invalid credentials")
+}
+
+type Claims struct {
+	UserID string `json:"user_id"`
+	Email  string `json:"email"`
+	Valid  bool   `json:"valid"`
+	jwt.RegisteredClaims
+}
+
+// internal/middleware/middleware.go
+package middleware
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"apigateway/internal/auth"
+	"apigateway/internal/balancer"
+	"apigateway/internal/ratelimit"
+)
+
+func Logger() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		path := c.Request.URL.Path
+		raw := c.Request.URL.RawQuery
+
+		c.Next()
+
+		end := time.Now()
+		latency := end.Sub(start)
+
+		fmt.Printf("[%s] %s %s %d %v %s\n",
+			end.Format("2006/01/02 15:04:05"),
+			c.Request.Method,
+			path,
+			c.Writer.Status(),
+			latency,
+			c.ClientIP(),
+		)
+
+		if raw != "" {
+			fmt.Printf("Query: %s\n", raw)
+		}
+	}
+}
+
+func CORS() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID")
+		c.Header("Access-Control-Expose-Headers", "X-Request-ID")
+
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+
+		c.Next()
+	}
+}
+
+func RequestID() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		requestID := c.GetHeader("X-Request-ID")
+		if requestID == "" {
+			requestID = uuid.New().String()
+		}
+		
+		c.Header("X-Request-ID", requestID)
+		c.Set("request_id", requestID)
+		c.Next()
+	}
+}
+
+func RateLimit(limiter *ratelimit.RateLimiter) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		clientID := c.ClientIP()
+		
+		// Use API key or user ID if available for more accurate limiting
+		if userID := c.GetHeader("X-User-ID"); userID != "" {
+			clientID = userID
+		}
+
+		if !limiter.Allow(clientID) {
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error": "Rate limit exceeded",
+				"retry_after": 60,
+			})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
+func Auth(authenticator *auth.Authenticator) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Skip auth for admin routes
+		if strings.HasPrefix(c.Request.URL.Path, "/admin") {
+			c.Next()
+			return
+		}
+
+		authHeader := c.GetHeader("Authorization")
+		claims, err := authenticator.ValidateRequest(authHeader)
+		
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error": "Authentication failed",
+				"message": err.Error(),
+			})
+			c.Abort()
+			return
+		}
+
+		c.Set("user_claims", claims)
+		c.Next()
+	}
+}
+
+func AdminAuth(adminToken string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		token := c.GetHeader("Authorization")
+		expectedToken := "Bearer " + adminToken
+
+		if token != expectedToken {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error": "Admin authentication required",
+			})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
+func LoadBalancer(lb *balancer.Balancer) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Set("load_balancer", lb)
+		c.Next()
+	}
+}
+
+// internal/proxy/proxy.go
+package proxy
+
+import (
+	"bytes"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"apigateway/internal/balancer"
+	"apigateway/internal/registry"
+)
+
+type Proxy struct {
+	registry     *registry.Registry
+	loadBalancer *balancer.Balancer
+	client       *http.Client
+}
+
+func New(registry *registry.Registry, loadBalancer *balancer.Balancer) *Proxy {
+	return &Proxy{
+		registry:     registry,
+		loadBalancer: loadBalancer,
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+}
+
+func (p *Proxy) Handle(c *gin.Context) {
+	// Find matching service
+	service, err := p.registry.GetService(c.Request.URL.Path)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "Service not found",
+			"path":  c.Request.URL.Path,
+		})
+		return
+	}
+
+	// Select upstream server
+	upstream, err := p.loadBalancer.SelectUpstream(service, c.ClientIP())
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "No upstream servers available",
+		})
+		return
+	}
+
+	// Track connection
+	p.loadBalancer.IncrementConnections(upstream)
+	defer p.loadBalancer.DecrementConnections(upstream)
+
+	// Proxy the request
+	if err := p.proxyRequest(c, service, upstream); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error": "Failed to proxy request",
+			"details": err.Error(),
+		})
+		return
+	}
+}
+
+func (p *Proxy) proxyRequest(c *gin.Context, service *models.Service, upstream string) error {
+	// Build target URL
+	targetURL, err := url.Parse(upstream)
+	if err != nil {
+		return err
+	}
+
+	// Remove service prefix from path
+	targetPath := strings.TrimPrefix(c.Request.URL.Path, service.PathPrefix)
+	if targetPath == "" {
+		targetPath = "/"
+	}
+	
+	targetURL.Path = targetPath
+	targetURL.RawQuery = c.Request.URL.RawQuery
+
+	// Read request body
+	var bodyBytes []byte
+	if c.Request.Body != nil {
+		bodyBytes, _ = io.ReadAll(c.Request.Body)
+		c.Request.Body.Close()
+	}
+
+	// Create proxy request
+	proxyReq, err := http.NewRequest(c.Request.Method, targetURL.String(), bytes.NewReader(bodyBytes))
+	if err != nil {
+		return err
+	}
+
+	// Copy headers (excluding hop-by-hop headers)
+	for key, values := range c.Request.Header {
+		if !isHopByHopHeader(key) {
+			for _, value := range values {
+				proxyReq.Header.Add(key, value)
+			}
+		}
+	}
+
+	// Add proxy headers
+	proxyReq.Header.Set("X-Forwarded-For", c.ClientIP())
+	proxyReq.Header.Set("X-Forwarded-Proto", "http")
+	if requestID := c.GetString("request_id"); requestID != "" {
+		proxyReq.Header.Set("X-Request-ID", requestID)
+	}
+
+	// Set timeout
+	client := p.client
+	if service.Timeout > 0 {
+		client = &http.Client{
+			Timeout: time.Duration(service.Timeout) * time.Second,
+		}
+	}
+
+	// Execute request with retries
+	var resp *http.Response
+	var lastErr error
+	
+	maxRetries := service.Retries
+	if maxRetries == 0 {
+		maxRetries = 1
+	}
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		resp, lastErr = client.Do(proxyReq)
+		if lastErr == nil {
+			break
+		}
+		
+		if attempt < maxRetries-1 {
+			time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+		}
+	}
+
+	if lastErr != nil {
+		return lastErr
+	}
+	defer resp.Body.Close()
+
+	// Copy response headers
+	for key, values := range resp.Header {
+		if !isHopByHopHeader(key) {
+			for _, value := range values {
+				c.Header(key, value)
+			}
+		}
+	}
+
+	// Copy response
+	c.Status(resp.StatusCode)
+	_, err = io.Copy(c.Writer, resp.Body)
+	return err
+}
+
+func isHopByHopHeader(header string) bool {
+	hopByHopHeaders := []string{
+		"Connection",
+		"Keep-Alive",
+		"Proxy-Authenticate",
+		"Proxy-Authorization",
+		"Te",
+		"Trailers",
+		"Transfer-Encoding",
+		"Upgrade",
+	}
+
+	header = strings.ToLower(header)
+	for _, h := range hopByHopHeaders {
+		if strings.ToLower(h) == header {
+			return true
+		}
+	}
+	return false
+}
+
+// go.mod
+module apigateway
+
+go 1.21
+
+require (
+	github.com/gin-gonic/gin v1.9.1
+	github.com/golang-jwt/jwt/v5 v5.0.0
+	github.com/google/uuid v1.3.0
+	github.com/joho/godotenv v1.4.0
+)
+
+// Dockerfile
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o main cmd/main.go
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+
+COPY --from=builder /app/main .
+COPY --from=builder /app/.env .
+
+EXPOSE 8080
+CMD ["./main"]
+
+// docker-compose.yml
+version: '3.8'
+
+services:
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - ADMIN_TOKEN=admin-secret-token
+      - AUTH_ENABLED=true
+      - JWT_SECRET=jwt-secret-key
+      - RATE_LIMIT=100
+      - BURST_SIZE=200
+    volumes:
+      - ./config:/config
+    restart: unless-stopped
+
+  # Example backend services
+  user-service:
+    image: nginx:alpine
+    ports:
+      - "8081:80"
+    volumes:
+      - ./examples/user-service.conf:/etc/nginx/nginx.conf
+
+  order-service:
+    image: nginx:alpine
+    ports:
+      - "8083:80"
+    volumes:
+      - ./examples/order-service.conf:/etc/nginx/nginx.conf
+
+// .env
+PORT=8080
+ADMIN_TOKEN=admin-secret-token
+READ_TIMEOUT=30
+WRITE_TIMEOUT=30
+IDLE_TIMEOUT=120
+MAX_HEADER_BYTES=1048576
+AUTH_ENABLED=true
+JWT_SECRET=jwt-secret-key
+API_KEY=default-api-key
+BASIC_AUTH=true
+RATE_LIMIT=100
+BURST_SIZE=200
+
+# Services configuration (JSON format)
+SERVICES_CONFIG=[{"id":"user-service","name":"User Service","pathPrefix":"/api/users","upstream":["http://localhost:8081"],"strategy":"round_robin","healthCheck":"/health","timeout":30,"retries":3}]
+
+// tests/proxy_test.go
+package tests
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"apigateway/internal/balancer"
+	"apigateway/internal/models"
+	"apigateway/internal/proxy"
+	"apigateway/internal/registry"
+)
+
+func TestProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// Create mock backend
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"message": "success"}`))
+	}))
+	defer backend.Close()
+
+	// Setup registry and balancer
+	reg := registry.New()
+	lb := balancer.New()
+	
+	// Register service
+	service := &models.Service{
+		ID:         "test-service",
+		PathPrefix: "/api/test",
+		Upstream:   []string{backend.URL},
+		Strategy:   "round_robin",
+	}
+	
+	reg.services = map[string]*models.Service{
+		"test-service": service,
+	}
+
+	// Create proxy
+	p := proxy.New(reg, lb)
+
+	// Setup router
+	router := gin.New()
+	router.NoRoute(p.Handle)
+
+	// Test request
+	req, _ := http.NewRequest("GET", "/api/test/users", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "success")
+}
+
+// tests/ratelimit_test.go
+package tests
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"apigateway/internal/config"
+	"apigateway/internal/ratelimit"
+)
+
+func TestRateLimit(t *testing.T) {
+	cfg := config.RateLimitConfig{
+		RequestsPerMinute: 10,
+		BurstSize:         5,
+	}
+	
+	limiter := ratelimit.New(cfg)
+	clientID := "test-client"
+
+	// Should allow first 5 requests (burst)
+	for i := 0; i < 5; i++ {
+		assert.True(t, limiter.Allow(clientID))
+	}
+
+	// Should deny 6th request
+	assert.False(t, limiter.Allow(clientID))
+
+	// Wait and should allow again
+	time.Sleep(10 * time.Millisecond)
+	// Note: In real implementation, this would require proper time advancement
+}
+
+// tests/auth_test.go
+package tests
+
+import (
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/stretchr/testify/assert"
+	"apigateway/internal/auth"
+	"apigateway/internal/config"
+)
+
+func TestJWTAuth(t *testing.T) {
+	cfg := config.AuthConfig{
+		Enabled:   true,
+		JWTSecret: "test-secret",
+	}
+	
+	authenticator := auth.New(cfg)
+
+	// Create valid JWT
+	claims := &auth.Claims{
+		UserID: "user123",
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		},
+	}
+	
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString([]byte(cfg.JWTSecret))
+	assert.NoError(t, err)
+
+	// Validate token
+	validatedClaims, err := authenticator.ValidateRequest("Bearer " + tokenString)
+	assert.NoError(t, err)
+	assert.Equal(t, "user123", validatedClaims.UserID)
+}
+
+func TestAPIKeyAuth(t *testing.T) {
+	cfg := config.AuthConfig{
+		Enabled: true,
+		APIKeys: []string{"valid-api-key"},
+	}
+	
+	authenticator := auth.New(cfg)
+
+	// Test valid API key
+	claims, err := authenticator.ValidateRequest("ApiKey valid-api-key")
+	assert.NoError(t, err)
+	assert.True(t, claims.Valid)
+
+	// Test invalid API key
+	_, err = authenticator.ValidateRequest("ApiKey invalid-key")
+	assert.Error(t, err)
+}
+
+// .github/workflows/ci.yml
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: 1.21
+    
+    - name: Install dependencies
+      run: go mod download
+    
+    - name: Run tests
+      run: go test -v ./...
+    
+    - name: Run tests with coverage
+      run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+    
+    - name: Upload coverage
+      uses: codecov/codecov-action@v3
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Run security scan
+      uses: securecodewarrior/github-action-add-sarif@v1
+      with:
+        sarif-file: 'security-scan-results.sarif'
+
+  build:
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Build Docker image
+      run: docker build -t apigateway:latest .
+    
+    - name: Test Docker image
+      run: |
+        docker run -d --name test-gateway -p 8080:8080 apigateway:latest
+        sleep 5
+        curl -f http://localhost:8080/admin/health || exit 1
+        docker stop test-gateway
+
+  deploy:
+    needs: [test, security, build]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Deploy to production
+      run: echo "Deploy to production environment"
+
+// examples/services.json
+[
+  {
+    "id": "user-service",
+    "name": "User Management Service",
+    "pathPrefix": "/api/users",
+    "upstream": [
+      "http://user-service-1:8080",
+      "http://user-service-2:8080"
+    ],
+    "strategy": "round_robin",
+    "healthCheck": "/health",
+    "timeout": 30,
+    "retries": 3
+  },
+  {
+    "id": "order-service", 
+    "name": "Order Management Service",
+    "pathPrefix": "/api/orders",
+    "upstream": [
+      "http://order-service:8080"
+    ],
+    "strategy": "least_conn",
+    "healthCheck": "/health",
+    "timeout": 45,
+    "retries": 2
+  },
+  {
+    "id": "payment-service",
+    "name": "Payment Processing Service", 
+    "pathPrefix": "/api/payments",
+    "upstream": [
+      "http://payment-service-1:8080",
+      "http://payment-service-2:8080",
+      "http://payment-service-3:8080"
+    ],
+    "strategy": "ip_hash",
+    "healthCheck": "/health",
+    "timeout": 60,
+    "retries": 5
+  }
+]
+
+// README.md
+# API Gateway
+
+A high-performance API Gateway with request routing, rate limiting, authentication, and load balancing.
+
+## Features
+
+- **Request Routing**: Path-based routing to upstream services
+- **Load Balancing**: Round-robin, least connections, IP hash strategies  
+- **Rate Limiting**: Token bucket algorithm with configurable limits
+- **Authentication**: JWT, API keys, Basic Auth support
+- **Admin API**: Service registration and management
+- **Health Checks**: Upstream service monitoring
+- **Request/Response Logging**: Detailed access logs
+- **Retry Logic**: Configurable retry attempts for failed requests
+- **CORS Support**: Cross-origin resource sharing
+- **Metrics**: Basic performance metrics
+
+## Quick Start
+
+1. Clone repository
+2. Configure services in `services.json`
+3. Start gateway: `docker-compose up`
+4. Access admin API: `http://localhost:8080/admin`
+
+## Configuration
+
+### Environment Variables
+
+```env
+PORT=8080
+ADMIN_TOKEN=admin-secret-token
+AUTH_ENABLED=true
+JWT_SECRET=jwt-secret-key
+RATE_LIMIT=100
+BURST_SIZE=200
+```
+
+### Service Configuration
+
+```json
+{
+  "id": "user-service",
+  "name": "User Service", 
+  "pathPrefix": "/api/users",
+  "upstream": ["http://user-service:8080"],
+  "strategy": "round_robin",
+  "timeout": 30,
+  "retries": 3
+}
+```
+
+## API Usage
+
+### Authentication
+
+```bash
+# JWT Token
+curl -H "Authorization: Bearer <jwt-token>" http://localhost:8080/api/users
+
+# API Key  
+curl -H "Authorization: ApiKey <api-key>" http://localhost:8080/api/users
+
+# Basic Auth
+curl -H "Authorization: Basic <base64-credentials>" http://localhost:8080/api/users
+```
+
+### Admin Operations
+
+```bash
+# List services
+curl -H "Authorization: Bearer admin-secret-token" http://localhost:8080/admin/services
+
+# Register service
+curl -X POST -H "Authorization: Bearer admin-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"new-service","pathPrefix":"/api/new","upstream":["http://new-service:8080"]}' \
+  http://localhost:8080/admin/services
+```
+
+## Load Balancing Strategies
+
+- **round_robin**: Distribute requests evenly across servers
+- **least_conn**: Route to server with fewest active connections  
+- **ip_hash**: Route based on client IP hash (sticky sessions)
+
+## Rate Limiting
+
+Token bucket algorithm with per-client limits:
+- `RequestsPerMinute`: Sustained rate limit
+- `BurstSize`: Maximum burst requests
+
+## Development
+
+```bash
+# Install dependencies
+go mod download
+
+# Run tests
+go test ./...
+
+# Start development server
+go run cmd/main.go
+```
+
+## Deployment
+
+```bash
+# Build and deploy
+docker-compose up --build
+
+# Scale gateway instances  
+docker-compose up --scale gateway=3
+```
+
+## Monitoring
+
+- Health endpoint: `/admin/health`
+- Metrics endpoint: `/admin/metrics`
+- Request logging with timing and status codes
