@@ -1,0 +1,330 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+type Server struct {
+	port       string
+	staticDir  string
+	startTime  time.Time
+	requests   int
+}
+
+type PageData struct {
+	Title     string
+	Message   string
+	Time      string
+	Requests  int
+	Uptime    string
+}
+
+func NewServer(port, staticDir string) *Server {
+	return &Server{
+		port:      port,
+		staticDir: staticDir,
+		startTime: time.Now(),
+		requests:  0,
+	}
+}
+
+func main() {
+	port := "8080"
+	staticDir := "./static"
+
+	if len(os.Args) > 1 {
+		port = os.Args[1]
+	}
+	if len(os.Args) > 2 {
+		staticDir = os.Args[2]
+	}
+
+	// Создаем директорию для статических файлов, если она не существует
+	os.MkdirAll(staticDir, 0755)
+	createSampleFiles(staticDir)
+
+	server := NewServer(port, staticDir)
+	server.setupRoutes()
+
+	fmt.Println("🌐 HTTP Сервер")
+	fmt.Printf("🚀 Запуск сервера на порту %s\n", port)
+	fmt.Printf("📁 Статические файлы из: %s\n", staticDir)
+	fmt.Printf("🌍 Откройте http://localhost:%s в браузере\n", port)
+	fmt.Printf("%s\n", strings.Repeat("-", 50))
+
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+func (s *Server) setupRoutes() {
+	// Middleware для подсчета запросов
+	http.HandleFunc("/", s.withLogging(s.handleHome))
+	http.HandleFunc("/api/status", s.withLogging(s.handleAPIStatus))
+	http.HandleFunc("/api/time", s.withLogging(s.handleAPITime))
+	http.HandleFunc("/api/echo", s.withLogging(s.handleAPIEcho))
+	http.HandleFunc("/health", s.withLogging(s.handleHealth))
+	
+	// Статические файлы
+	http.HandleFunc("/static/", s.withLogging(s.handleStatic))
+}
+
+func (s *Server) withLogging(handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		s.requests++
+		start := time.Now()
+		
+		// Логируем запрос
+		fmt.Printf("📨 %s %s %s", r.Method, r.URL.Path, r.RemoteAddr)
+		
+		handler(w, r)
+		
+		// Логируем время выполнения
+		duration := time.Since(start)
+		fmt.Printf(" (%v)\n", duration)
+	}
+}
+
+func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		s.handleNotFound(w, r)
+		return
+	}
+
+	tmpl := `<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{.Title}}</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+        .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #333; text-align: center; }
+        .stats { background: #e8f4fd; padding: 15px; border-radius: 5px; margin: 20px 0; }
+        .api-list { background: #f8f9fa; padding: 15px; border-radius: 5px; }
+        .endpoint { margin: 10px 0; }
+        a { color: #007bff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .emoji { font-size: 1.2em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🌐 {{.Title}}</h1>
+        <p>{{.Message}}</p>
+        
+        <div class="stats">
+            <h3>📊 Статистика сервера</h3>
+            <p>⏰ Время сервера: {{.Time}}</p>
+            <p>📈 Всего запросов: {{.Requests}}</p>
+            <p>⚡ Время работы: {{.Uptime}}</p>
+        </div>
+
+        <div class="api-list">
+            <h3>🔗 Доступные эндпоинты</h3>
+            <div class="endpoint">📊 <a href="/api/status">/api/status</a> - Статус сервера (JSON)</div>
+            <div class="endpoint">⏰ <a href="/api/time">/api/time</a> - Текущее время (JSON)</div>
+            <div class="endpoint">🔄 <a href="/api/echo?message=hello">/api/echo</a> - Эхо сообщения (JSON)</div>
+            <div class="endpoint">❤️ <a href="/health">/health</a> - Проверка здоровья</div>
+            <div class="endpoint">📁 <a href="/static/">/static/</a> - Статические файлы</div>
+        </div>
+    </div>
+</body>
+</html>`
+
+	t, err := template.New("home").Parse(tmpl)
+	if err != nil {
+		http.Error(w, "Ошибка шаблона", http.StatusInternalServerError)
+		return
+	}
+
+	data := PageData{
+		Title:    "Простой HTTP Сервер",
+		Message:  "Добро пожаловать! Сервер работает корректно.",
+		Time:     time.Now().Format("2006-01-02 15:04:05"),
+		Requests: s.requests,
+		Uptime:   time.Since(s.startTime).String(),
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	t.Execute(w, data)
+}
+
+func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
+	status := map[string]interface{}{
+		"status":       "ok",
+		"server":       "Simple HTTP Server",
+		"version":      "1.0.0",
+		"uptime":       time.Since(s.startTime).String(),
+		"requests":     s.requests,
+		"timestamp":    time.Now().Unix(),
+		"time":         time.Now().Format("2006-01-02 15:04:05"),
+	}
+
+	s.writeJSON(w, status)
+}
+
+func (s *Server) handleAPITime(w http.ResponseWriter, r *http.Request) {
+	timeData := map[string]interface{}{
+		"unix":      time.Now().Unix(),
+		"formatted": time.Now().Format("2006-01-02 15:04:05"),
+		"iso":       time.Now().Format(time.RFC3339),
+		"timezone":  time.Now().Format("MST"),
+	}
+
+	s.writeJSON(w, timeData)
+}
+
+func (s *Server) handleAPIEcho(w http.ResponseWriter, r *http.Request) {
+	message := r.URL.Query().Get("message")
+	if message == "" {
+		message = "Привет от сервера!"
+	}
+
+	echo := map[string]interface{}{
+		"echo":      message,
+		"method":    r.Method,
+		"path":      r.URL.Path,
+		"timestamp": time.Now().Format("2006-01-02 15:04:05"),
+		"client_ip": r.RemoteAddr,
+	}
+
+	s.writeJSON(w, echo)
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "✅ Server is healthy\n⏰ Uptime: %s\n📈 Requests: %d\n", 
+		time.Since(s.startTime).String(), s.requests)
+}
+
+func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
+	// Убираем /static/ из пути
+	filepath := strings.TrimPrefix(r.URL.Path, "/static/")
+	if filepath == "" {
+		s.handleStaticIndex(w, r)
+		return
+	}
+
+	fullPath := filepath.Join(s.staticDir, filepath)
+	
+	// Проверяем, что файл существует
+	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+		s.handleNotFound(w, r)
+		return
+	}
+
+	http.ServeFile(w, r, fullPath)
+}
+
+func (s *Server) handleStaticIndex(w http.ResponseWriter, r *http.Request) {
+	files, err := os.ReadDir(s.staticDir)
+	if err != nil {
+		http.Error(w, "Ошибка чтения директории", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head>
+    <title>📁 Статические файлы</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }
+        .file { margin: 10px 0; padding: 10px; background: #f8f9fa; border-radius: 5px; }
+        a { color: #007bff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <h1>📁 Статические файлы</h1>
+    <p><a href="/">← Назад на главную</a></p>
+`)
+
+	for _, file := range files {
+		if !file.IsDir() {
+			fmt.Fprintf(w, `<div class="file">📄 <a href="/static/%s">%s</a></div>`, 
+				file.Name(), file.Name())
+		}
+	}
+
+	fmt.Fprintf(w, `</body></html>`)
+}
+
+func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusNotFound)
+	fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head>
+    <title>404 - Страница не найдена</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+        .error { color: #dc3545; }
+    </style>
+</head>
+<body>
+    <h1 class="error">404 - Страница не найдена</h1>
+    <p>Запрашиваемый ресурс не найден: %s</p>
+    <p><a href="/">← Вернуться на главную</a></p>
+</body>
+</html>`, r.URL.Path)
+}
+
+func (s *Server) writeJSON(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	json.NewEncoder(w).Encode(data)
+}
+
+func createSampleFiles(staticDir string) {
+	// Создаем пример HTML файла
+	htmlContent := `<!DOCTYPE html>
+<html>
+<head>
+    <title>Пример HTML файла</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; }
+        .highlight { background: yellow; }
+    </style>
+</head>
+<body>
+    <h1>🎉 Это пример HTML файла</h1>
+    <p>Этот файл обслуживается статически через HTTP сервер.</p>
+    <p class="highlight">Время создания: ` + time.Now().Format("2006-01-02 15:04:05") + `</p>
+</body>
+</html>`
+
+	os.WriteFile(filepath.Join(staticDir, "example.html"), []byte(htmlContent), 0644)
+
+	// Создаем пример CSS файла
+	cssContent := `body {
+    background-color: #f0f8ff;
+    margin: 0;
+    padding: 20px;
+}
+
+.container {
+    max-width: 800px;
+    margin: 0 auto;
+    background: white;
+    padding: 20px;
+    border-radius: 10px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+}`
+
+	os.WriteFile(filepath.Join(staticDir, "style.css"), []byte(cssContent), 0644)
+
+	// Создаем пример текстового файла
+	txtContent := "Это пример текстового файла.\nОн обслуживается статически через HTTP сервер.\nВремя создания: " + time.Now().Format("2006-01-02 15:04:05")
+	
+	os.WriteFile(filepath.Join(staticDir, "readme.txt"), []byte(txtContent), 0644)
+}
