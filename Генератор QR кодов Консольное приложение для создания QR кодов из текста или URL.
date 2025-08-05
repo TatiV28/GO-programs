@@ -1,0 +1,170 @@
+// QR Code Generator
+// main.go
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log"
+	"os"
+
+	"github.com/skip2/go-qrcode"
+)
+
+type Config struct {
+	Text     string
+	Output   string
+	Size     int
+	Level    string
+}
+
+func main() {
+	config := parseFlags()
+	
+	if err := generateQRCode(config); err != nil {
+		log.Fatalf("Ошибка генерации QR кода: %v", err)
+	}
+	
+	fmt.Printf("QR код успешно создан: %s\n", config.Output)
+}
+
+func parseFlags() *Config {
+	config := &Config{}
+	
+	flag.StringVar(&config.Text, "text", "", "Текст или URL для QR кода")
+	flag.StringVar(&config.Output, "output", "qrcode.png", "Путь к выходному файлу")
+	flag.IntVar(&config.Size, "size", 256, "Размер QR кода в пикселях")
+	flag.StringVar(&config.Level, "level", "medium", "Уровень коррекции ошибок (low, medium, high, highest)")
+	
+	flag.Parse()
+	
+	if config.Text == "" {
+		fmt.Println("Использование:")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+	
+	return config
+}
+
+func generateQRCode(config *Config) error {
+	level := getRecoveryLevel(config.Level)
+	
+	return qrcode.WriteFile(config.Text, level, config.Size, config.Output)
+}
+
+func getRecoveryLevel(level string) qrcode.RecoveryLevel {
+	switch level {
+	case "low":
+		return qrcode.Low
+	case "medium":
+		return qrcode.Medium
+	case "high":
+		return qrcode.High
+	case "highest":
+		return qrcode.Highest
+	default:
+		return qrcode.Medium
+	}
+}
+
+// go.mod
+module qr-generator
+
+go 1.21
+
+require github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
+
+// main_test.go
+package main
+
+import (
+	"os"
+	"testing"
+	"github.com/skip2/go-qrcode"
+)
+
+func TestGenerateQRCode(t *testing.T) {
+	config := &Config{
+		Text:   "https://example.com",
+		Output: "test_qr.png",
+		Size:   128,
+		Level:  "medium",
+	}
+	
+	err := generateQRCode(config)
+	if err != nil {
+		t.Fatalf("Ошибка генерации QR кода: %v", err)
+	}
+	
+	// Проверяем, что файл создался
+	if _, err := os.Stat(config.Output); os.IsNotExist(err) {
+		t.Fatalf("Файл QR кода не был создан")
+	}
+	
+	// Очищаем после теста
+	os.Remove(config.Output)
+}
+
+func TestGetRecoveryLevel(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected qrcode.RecoveryLevel
+	}{
+		{"low", qrcode.Low},
+		{"medium", qrcode.Medium},
+		{"high", qrcode.High},
+		{"highest", qrcode.Highest},
+		{"invalid", qrcode.Medium},
+	}
+	
+	for _, test := range tests {
+		result := getRecoveryLevel(test.input)
+		if result != test.expected {
+			t.Errorf("Для %s ожидался уровень %v, получен %v", test.input, test.expected, result)
+		}
+	}
+}
+
+// Dockerfile
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN go build -o qr-generator .
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+
+COPY --from=builder /app/qr-generator .
+
+ENTRYPOINT ["./qr-generator"]
+
+// README.md
+# QR Code Generator
+
+Консольное приложение для создания QR кодов из текста или URL.
+
+## Использование
+
+```bash
+go run main.go -text "Hello World" -output qr.png -size 256 -level medium
+```
+
+## Параметры
+
+- `-text` - текст или URL для QR кода (обязательный)
+- `-output` - путь к выходному файлу (по умолчанию: qrcode.png)
+- `-size` - размер QR кода в пикселях (по умолчанию: 256)
+- `-level` - уровень коррекции ошибок: low, medium, high, highest (по умолчанию: medium)
+
+## Docker
+
+```bash
+docker build -t qr-generator .
+docker run -v $(pwd):/output qr-generator -text "Hello Docker" -output /output/qr.png
+```
