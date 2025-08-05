@@ -288,4 +288,473 @@ func (s *AuthService) RefreshToken(c *gin.Context) {
 		return
 	}
 
-	//
+	// Проверяем refresh токен
+	var refreshToken RefreshToken
+	if err := s.db.Where("token = ? AND is_revoked = false AND expires_at > ?", req.RefreshToken, time.Now()).First(&refreshToken).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Неверный refresh токен"})
+		return
+	}
+
+	// Получаем пользователя
+	var user User
+	if err := s.db.First(&user, refreshToken.UserID).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Пользователь не найден"})
+		return
+	}
+
+	// Отзываем старый refresh токен
+	refreshToken.IsRevoked = true
+	s.db.Save(&refreshToken)
+
+	// Генерируем новые токены
+	tokens, err := s.generateTokens(&user)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка генерации токенов"})
+		return
+	}
+
+	c.JSON(http.StatusOK, tokens)
+}
+
+func (s *AuthService) GetProfile(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+	
+	var user User
+	if err := s.db.First(&user, userID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Пользователь не найден"})
+		return
+	}
+
+	c.JSON(http.StatusOK, user)
+}
+
+func (s *AuthService) UpdateProfile(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+	
+	var user User
+	if err := s.db.First(&user, userID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Пользователь не найден"})
+		return
+	}
+
+	var updateReq struct {
+		FirstName string `json:"first_name"`
+		LastName  string `json:"last_name"`
+		Email     string `json:"email" binding:"omitempty,email"`
+	}
+
+	if err := c.ShouldBindJSON(&updateReq); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Проверяем уникальность email если он изменился
+	if updateReq.Email != "" && updateReq.Email != user.Email {
+		var existingUser User
+		if err := s.db.Where("email = ? AND id != ?", updateReq.Email, user.ID).First(&existingUser).Error; err == nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Email уже используется"})
+			return
+		}
+		user.Email = updateReq.Email
+	}
+
+	if updateReq.FirstName != "" {
+		user.FirstName = updateReq.FirstName
+	}
+	if updateReq.LastName != "" {
+		user.LastName = updateReq.LastName
+	}
+
+	if err := s.db.Save(&user).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка обновления профиля"})
+		return
+	}
+
+	c.JSON(http.StatusOK, user)
+}
+
+func (s *AuthService) Logout(c *gin.Context) {
+	// Получаем refresh токен из заголовка
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Токен не предоставлен"})
+		return
+	}
+
+	// Отзываем все refresh токены пользователя
+	userID, _ := c.Get("user_id")
+	s.db.Model(&RefreshToken{}).Where("user_id = ?", userID).Update("is_revoked", true)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Успешный выход"})
+}
+
+func (s *AuthService) GetAllUsers(c *gin.Context) {
+	var users []User
+	
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "10"))
+	offset := (page - 1) * limit
+	
+	result := s.db.Offset(offset).Limit(limit).Find(&users)
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": result.Error.Error()})
+		return
+	}
+	
+	var total int64
+	s.db.Model(&User{}).Count(&total)
+	
+	c.JSON(http.StatusOK, gin.H{
+		"users": users,
+		"pagination": gin.H{
+			"page":  page,
+			"limit": limit,
+			"total": total,
+		},
+	})
+}
+
+func (s *AuthService) DeleteUser(c *gin.Context) {
+	id := c.Param("id")
+	currentUserID, _ := c.Get("user_id")
+	
+	// Запрещаем удаление самого себя
+	if strconv.Itoa(int(currentUserID.(uint))) == id {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Нельзя удалить самого себя"})
+		return
+	}
+	
+	result := s.db.Delete(&User{}, id)
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": result.Error.Error()})
+		return
+	}
+	
+	if result.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Пользователь не найден"})
+		return
+	}
+	
+	c.JSON(http.StatusOK, gin.H{"message": "Пользователь удален"})
+}
+
+func (s *AuthService) generateTokens(user *User) (*TokenResponse, error) {
+	// Создаем access токен
+	claims := &Claims{
+		UserID:   user.ID,
+		Username: user.Username,
+		Role:     user.Role,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(15 * time.Minute)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	accessToken, err := token.SignedString(s.jwtSecret)
+	if err != nil {
+		return nil, err
+	}
+
+	// Создаем refresh токен
+	refreshTokenString, err := s.generateRandomToken()
+	if err != nil {
+		return nil, err
+	}
+
+	refreshToken := RefreshToken{
+		UserID:    user.ID,
+		Token:     refreshTokenString,
+		ExpiresAt: time.Now().Add(7 * 24 * time.Hour), // 7 дней
+	}
+
+	if err := s.db.Create(&refreshToken).Error; err != nil {
+		return nil, err
+	}
+
+	return &TokenResponse{
+		AccessToken:  accessToken,
+		RefreshToken: refreshTokenString,
+		TokenType:    "Bearer",
+		ExpiresIn:    900, // 15 минут в секундах
+	}, nil
+}
+
+func (s *AuthService) generateRandomToken() (string, error) {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes), nil
+}
+
+// middleware.go
+package main
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
+)
+
+func authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+		if authHeader == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Токен авторизации отсутствует"})
+			c.Abort()
+			return
+		}
+
+		bearerToken := strings.Split(authHeader, " ")
+		if len(bearerToken) != 2 || bearerToken[0] != "Bearer" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Неверный формат токена"})
+			c.Abort()
+			return
+		}
+
+		tokenString := bearerToken[1]
+		
+		secret := os.Getenv("JWT_SECRET")
+		if secret == "" {
+			secret = "your-secret-key-change-in-production"
+		}
+
+		token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+			return []byte(secret), nil
+		})
+
+		if err != nil || !token.Valid {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Неверный токен"})
+			c.Abort()
+			return
+		}
+
+		claims, ok := token.Claims.(*Claims)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Неверные данные токена"})
+			c.Abort()
+			return
+		}
+
+		c.Set("user_id", claims.UserID)
+		c.Set("username", claims.Username)
+		c.Set("role", claims.Role)
+		c.Next()
+	}
+}
+
+func adminMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		role, exists := c.Get("role")
+		if !exists || role != "admin" {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Доступ запрещен"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// go.mod
+module auth-system
+
+go 1.21
+
+require (
+	github.com/gin-gonic/gin v1.9.1
+	github.com/golang-jwt/jwt/v5 v5.2.0
+	golang.org/x/crypto v0.17.0
+	gorm.io/driver/postgres v1.5.4
+	gorm.io/gorm v1.25.5
+)
+
+// main_test.go
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+)
+
+func setupTestDB() *gorm.DB {
+	db, _ := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	db.AutoMigrate(&User{}, &RefreshToken{})
+	return db
+}
+
+func setupTestRouter() (*gin.Engine, *AuthService) {
+	gin.SetMode(gin.TestMode)
+	db := setupTestDB()
+	authService := NewAuthService(db)
+	
+	r := gin.New()
+	
+	auth := r.Group("/api/auth")
+	{
+		auth.POST("/register", authService.Register)
+		auth.POST("/login", authService.Login)
+	}
+	
+	protected := r.Group("/api/protected")
+	protected.Use(authMiddleware())
+	{
+		protected.GET("/profile", authService.GetProfile)
+	}
+	
+	return r, authService
+}
+
+func TestRegister(t *testing.T) {
+	router, _ := setupTestRouter()
+	
+	registerReq := RegisterRequest{
+		Username:  "testuser",
+		Email:     "test@example.com",
+		Password:  "password123",
+		FirstName: "Test",
+		LastName:  "User",
+	}
+	
+	jsonData, _ := json.Marshal(registerReq)
+	req, _ := http.NewRequest("POST", "/api/auth/register", bytes.NewBuffer(jsonData))
+	req.Header.Set("Content-Type", "application/json")
+	
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	
+	assert.Equal(t, http.StatusCreated, w.Code)
+}
+
+func TestLogin(t *testing.T) {
+	router, authService := setupTestRouter()
+	
+	// Сначала регистрируем пользователя
+	hashedPassword, _ := bcrypt.GenerateFromPassword([]byte("password123"), bcrypt.DefaultCost)
+	user := User{
+		Username: "testuser",
+		Email:    "test@example.com",
+		Password: string(hashedPassword),
+		Role:     "user",
+		IsActive: true,
+	}
+	authService.db.Create(&user)
+	
+	loginReq := LoginRequest{
+		Username: "testuser",
+		Password: "password123",
+	}
+	
+	jsonData, _ := json.Marshal(loginReq)
+	req, _ := http.NewRequest("POST", "/api/auth/login", bytes.NewBuffer(jsonData))
+	req.Header.Set("Content-Type", "application/json")
+	
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+// Dockerfile
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN go build -o auth-system .
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+
+COPY --from=builder /app/auth-system .
+
+EXPOSE 8080
+
+CMD ["./auth-system"]
+
+// docker-compose.yml
+version: '3.8'
+
+services:
+  auth:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - DATABASE_URL=host=postgres user=postgres password=postgres dbname=authdb port=5432 sslmode=disable
+      - JWT_SECRET=your-super-secret-jwt-key-change-in-production
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=authdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
+
+// .env.example
+DATABASE_URL=host=localhost user=postgres password=postgres dbname=authdb port=5432 sslmode=disable
+JWT_SECRET=your-super-secret-jwt-key-change-in-production
+PORT=8080
+
+// README.md
+# Authentication System
+
+Система аутентификации с JWT токенами, регистрацией, авторизацией и middleware для защиты роутов.
+
+## Возможности
+
+- Регистрация и авторизация пользователей
+- JWT токены с refresh токенами
+- Middleware для защиты роутов
+- Роли пользователей (user, admin)
+- CRUD операции с пользователями
+- Безопасное хранение паролей (bcrypt)
+
+## API Endpoints
+
+### Публичные маршруты
+- `POST /api/auth/register` - регистрация
+- `POST /api/auth/login` - авторизация  
+- `POST /api/auth/refresh` - обновление токена
+
+### Защищенные маршруты
+- `GET /api/protected/profile` - получить профиль
+- `PUT /api/protected/profile` - обновить профиль
+- `POST /api/protected/logout` - выход
+
+### Администраторские маршруты
+- `GET /api/admin/users` - список пользователей
+- `DELETE /api/admin/users/:id` - удалить пользователя
+
+## Запуск
+
+```bash
+# С Docker Compose
+docker-compose up
+
+# Локально
+go mod tidy
+go run .
+```
