@@ -1,0 +1,1051 @@
+client := &Client{
+		hub:    s.hub,
+		conn:   conn,
+		send:   make(chan []byte, 256),
+		userID: uint(userID),
+		roomID: uint(roomID),
+	}
+
+	s.hub.register <- client
+
+	go client.writePump()
+	go client.readPump()
+}
+
+// go.mod
+module websocket-chat
+
+go 1.21
+
+require (
+	github.com/gin-gonic/gin v1.9.1
+	github.com/gorilla/websocket v1.5.1
+	gorm.io/driver/postgres v1.5.4
+	gorm.io/gorm v1.25.5
+)
+
+// web/templates/index.html
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebSocket Chat</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        #messages {
+            height: 400px;
+            overflow-y: auto;
+            border: 1px solid #dee2e6;
+            padding: 10px;
+            margin-bottom: 10px;
+        }
+        .message {
+            margin-bottom: 10px;
+            padding: 8px;
+            border-radius: 5px;
+        }
+        .message.own {
+            background-color: #007bff;
+            color: white;
+            margin-left: 20%;
+        }
+        .message.other {
+            background-color: #f8f9fa;
+            margin-right: 20%;
+        }
+        .typing {
+            font-style: italic;
+            color: #6c757d;
+        }
+        .user-list {
+            height: 400px;
+            overflow-y: auto;
+            border: 1px solid #dee2e6;
+            padding: 10px;
+        }
+        .online {
+            color: #28a745;
+        }
+        .offline {
+            color: #6c757d;
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid mt-3">
+        <div class="row">
+            <div class="col-md-9">
+                <div class="card">
+                    <div class="card-header">
+                        <h5>Chat Room</h5>
+                    </div>
+                    <div class="card-body">
+                        <div id="messages"></div>
+                        <div id="typing" class="typing"></div>
+                        <div class="input-group">
+                            <input type="text" id="messageInput" class="form-control" placeholder="Введите сообщение...">
+                            <button class="btn btn-primary" type="button" id="sendButton">Отправить</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card">
+                    <div class="card-header">
+                        <h6>Пользователи онлайн</h6>
+                    </div>
+                    <div class="card-body">
+                        <div id="userList" class="user-list"></div>
+                    </div>
+                </div>
+                <div class="card mt-3">
+                    <div class="card-body">
+                        <h6>Настройки</h6>
+                        <div class="mb-2">
+                            <label for="userIdInput" class="form-label">User ID:</label>
+                            <input type="number" id="userIdInput" class="form-control" value="1">
+                        </div>
+                        <div class="mb-2">
+                            <label for="roomIdInput" class="form-label">Room ID:</label>
+                            <input type="number" id="roomIdInput" class="form-control" value="1">
+                        </div>
+                        <button id="connectButton" class="btn btn-success btn-sm">Подключиться</button>
+                        <button id="disconnectButton" class="btn btn-danger btn-sm">Отключиться</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let ws;
+        let currentUserId = 1;
+        let currentRoomId = 1;
+        let typingTimer;
+        let isTyping = false;
+
+        const messagesDiv = document.getElementById('messages');
+        const messageInput = document.getElementById('messageInput');
+        const sendButton = document.getElementById('sendButton');
+        const connectButton = document.getElementById('connectButton');
+        const disconnectButton = document.getElementById('disconnectButton');
+        const userIdInput = document.getElementById('userIdInput');
+        const roomIdInput = document.getElementById('roomIdInput');
+        const typingDiv = document.getElementById('typing');
+        const userListDiv = document.getElementById('userList');
+
+        function connect() {
+            currentUserId = parseInt(userIdInput.value);
+            currentRoomId = parseInt(roomIdInput.value);
+            
+            const wsUrl = `ws://localhost:8080/api/ws?user_id=${currentUserId}&room_id=${currentRoomId}`;
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = function(event) {
+                console.log('Connected to WebSocket');
+                connectButton.disabled = true;
+                disconnectButton.disabled = false;
+                messageInput.disabled = false;
+                sendButton.disabled = false;
+                loadMessages();
+                loadUsers();
+            };
+
+            ws.onmessage = function(event) {
+                const message = JSON.parse(event.data);
+                handleMessage(message);
+            };
+
+            ws.onclose = function(event) {
+                console.log('Disconnected from WebSocket');
+                connectButton.disabled = false;
+                disconnectButton.disabled = true;
+                messageInput.disabled = true;
+                sendButton.disabled = true;
+            };
+
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+            };
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+            }
+        }
+
+        function sendMessage() {
+            const content = messageInput.value.trim();
+            if (content && ws.readyState === WebSocket.OPEN) {
+                const message = {
+                    type: 'chat_message',
+                    data: {
+                        content: content
+                    }
+                };
+                ws.send(JSON.stringify(message));
+                messageInput.value = '';
+                stopTyping();
+            }
+        }
+
+        function handleMessage(message) {
+            switch (message.type) {
+                case 'new_message':
+                    displayMessage(message.data);
+                    break;
+                case 'user_joined':
+                case 'user_left':
+                    updateUserList();
+                    break;
+                case 'typing':
+                    handleTyping(message.data);
+                    break;
+            }
+        }
+
+        function displayMessage(message) {
+            const messageElement = document.createElement('div');
+            messageElement.className = `message ${message.user_id === currentUserId ? 'own' : 'other'}`;
+            
+            const time = new Date(message.created_at).toLocaleTimeString();
+            messageElement.innerHTML = `
+                <div><strong>${message.username}</strong> <small>${time}</small></div>// WebSocket Chat Server
+// main.go
+package main
+
+import (
+	"log"
+	"net/http"
+	"os"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+)
+
+func main() {
+	// Подключение к базе данных
+	db, err := initDB()
+	if err != nil {
+		log.Fatal("Ошибка подключения к базе данных:", err)
+	}
+
+	// Автоматическая миграция
+	db.AutoMigrate(&User{}, &Room{}, &Message{}, &UserRoom{})
+
+	// Инициализация хаба чата
+	hub := NewChatHub(db)
+	go hub.Run()
+
+	// Инициализация сервисов
+	chatService := NewChatService(db, hub)
+	
+	// Настройка роутера
+	r := gin.Default()
+	r.Use(corsMiddleware())
+
+	// Статические файлы для демо
+	r.Static("/static", "./web/static")
+	r.LoadHTMLGlob("web/templates/*")
+
+	// Веб-интерфейс
+	r.GET("/", func(c *gin.Context) {
+		c.HTML(http.StatusOK, "index.html", nil)
+	})
+
+	// API маршруты
+	api := r.Group("/api")
+	{
+		// Пользователи
+		api.POST("/users", chatService.CreateUser)
+		api.GET("/users", chatService.GetUsers)
+		api.GET("/users/:id", chatService.GetUser)
+
+		// Комнаты
+		api.POST("/rooms", chatService.CreateRoom)
+		api.GET("/rooms", chatService.GetRooms)
+		api.GET("/rooms/:id", chatService.GetRoom)
+		api.POST("/rooms/:id/join", chatService.JoinRoom)
+		api.POST("/rooms/:id/leave", chatService.LeaveRoom)
+		api.GET("/rooms/:id/messages", chatService.GetRoomMessages)
+		api.GET("/rooms/:id/users", chatService.GetRoomUsers)
+
+		// WebSocket подключение
+		api.GET("/ws", chatService.HandleWebSocket)
+	}
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("Chat Server запущен на порту %s", port)
+	r.Run(":" + port)
+}
+
+func initDB() (*gorm.DB, error) {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "host=localhost user=postgres password=postgres dbname=chatdb port=5432 sslmode=disable"
+	}
+	
+	return gorm.Open(postgres.Open(dsn), &gorm.Config{})
+}
+
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// models.go
+package main
+
+import (
+	"time"
+	"gorm.io/gorm"
+)
+
+type User struct {
+	ID        uint           `json:"id" gorm:"primarykey"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
+	Username  string         `json:"username" gorm:"uniqueIndex;not null" binding:"required"`
+	Email     string         `json:"email" gorm:"uniqueIndex;not null" binding:"required,email"`
+	Avatar    string         `json:"avatar"`
+	IsOnline  bool           `json:"is_online" gorm:"default:false"`
+	LastSeen  *time.Time     `json:"last_seen"`
+	Rooms     []Room         `json:"rooms,omitempty" gorm:"many2many:user_rooms;"`
+	Messages  []Message      `json:"messages,omitempty" gorm:"foreignKey:UserID"`
+}
+
+type Room struct {
+	ID          uint           `json:"id" gorm:"primarykey"`
+	CreatedAt   time.Time      `json:"created_at"`
+	UpdatedAt   time.Time      `json:"updated_at"`
+	DeletedAt   gorm.DeletedAt `json:"-" gorm:"index"`
+	Name        string         `json:"name" gorm:"not null" binding:"required"`
+	Description string         `json:"description"`
+	IsPrivate   bool           `json:"is_private" gorm:"default:false"`
+	CreatedBy   uint           `json:"created_by" gorm:"not null"`
+	Users       []User         `json:"users,omitempty" gorm:"many2many:user_rooms;"`
+	Messages    []Message      `json:"messages,omitempty" gorm:"foreignKey:RoomID"`
+}
+
+type Message struct {
+	ID        uint           `json:"id" gorm:"primarykey"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
+	Content   string         `json:"content" gorm:"not null" binding:"required"`
+	Type      string         `json:"type" gorm:"default:text"` // text, image, file, system
+	UserID    uint           `json:"user_id" gorm:"not null"`
+	RoomID    uint           `json:"room_id" gorm:"not null"`
+	User      User           `json:"user" gorm:"foreignKey:UserID"`
+	Room      Room           `json:"room,omitempty" gorm:"foreignKey:RoomID"`
+}
+
+type UserRoom struct {
+	UserID   uint      `json:"user_id" gorm:"primarykey"`
+	RoomID   uint      `json:"room_id" gorm:"primarykey"`
+	JoinedAt time.Time `json:"joined_at" gorm:"default:CURRENT_TIMESTAMP"`
+	Role     string    `json:"role" gorm:"default:member"` // admin, moderator, member
+}
+
+// WebSocket сообщения
+type WSMessage struct {
+	Type    string      `json:"type"`
+	Data    interface{} `json:"data"`
+	UserID  uint        `json:"user_id,omitempty"`
+	RoomID  uint        `json:"room_id,omitempty"`
+	Error   string      `json:"error,omitempty"`
+}
+
+type ChatMessage struct {
+	ID        uint      `json:"id"`
+	Content   string    `json:"content"`
+	Type      string    `json:"type"`
+	UserID    uint      `json:"user_id"`
+	RoomID    uint      `json:"room_id"`
+	Username  string    `json:"username"`
+	Avatar    string    `json:"avatar"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type UserStatus struct {
+	UserID   uint   `json:"user_id"`
+	Username string `json:"username"`
+	IsOnline bool   `json:"is_online"`
+}
+
+// hub.go
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"gorm.io/gorm"
+)
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // В продакшене нужна более строгая проверка
+	},
+}
+
+type Client struct {
+	hub    *ChatHub
+	conn   *websocket.Conn
+	send   chan []byte
+	userID uint
+	roomID uint
+}
+
+type ChatHub struct {
+	clients    map[*Client]bool
+	rooms      map[uint]map[*Client]bool
+	register   chan *Client
+	unregister chan *Client
+	broadcast  chan []byte
+	db         *gorm.DB
+}
+
+func NewChatHub(db *gorm.DB) *ChatHub {
+	return &ChatHub{
+		clients:    make(map[*Client]bool),
+		rooms:      make(map[uint]map[*Client]bool),
+		register:   make(chan *Client),
+		unregister: make(chan *Client),
+		broadcast:  make(chan []byte, 256),
+		db:         db,
+	}
+}
+
+func (h *ChatHub) Run() {
+	for {
+		select {
+		case client := <-h.register:
+			h.clients[client] = true
+			
+			// Добавляем клиента в комнату
+			if _, ok := h.rooms[client.roomID]; !ok {
+				h.rooms[client.roomID] = make(map[*Client]bool)
+			}
+			h.rooms[client.roomID][client] = true
+			
+			// Обновляем статус пользователя на онлайн
+			h.updateUserStatus(client.userID, true)
+			
+			// Отправляем уведомление о подключении в комнату
+			h.broadcastToRoom(client.roomID, WSMessage{
+				Type: "user_joined",
+				Data: UserStatus{
+					UserID:   client.userID,
+					Username: h.getUsernameByID(client.userID),
+					IsOnline: true,
+				},
+			})
+
+		case client := <-h.unregister:
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				delete(h.rooms[client.roomID], client)
+				close(client.send)
+				
+				// Обновляем статус пользователя
+				h.updateUserStatus(client.userID, false)
+				
+				// Отправляем уведомление об отключении
+				h.broadcastToRoom(client.roomID, WSMessage{
+					Type: "user_left",
+					Data: UserStatus{
+						UserID:   client.userID,
+						Username: h.getUsernameByID(client.userID),
+						IsOnline: false,
+					},
+				})
+			}
+
+		case message := <-h.broadcast:
+			var wsMsg WSMessage
+			if err := json.Unmarshal(message, &wsMsg); err != nil {
+				continue
+			}
+			
+			// Отправляем сообщение всем клиентам в комнате
+			if wsMsg.RoomID > 0 {
+				h.broadcastToRoom(wsMsg.RoomID, wsMsg)
+			}
+		}
+	}
+}
+
+func (h *ChatHub) broadcastToRoom(roomID uint, message WSMessage) {
+	if clients, ok := h.rooms[roomID]; ok {
+		messageBytes, _ := json.Marshal(message)
+		for client := range clients {
+			select {
+			case client.send <- messageBytes:
+			default:
+				close(client.send)
+				delete(h.clients, client)
+				delete(h.rooms[roomID], client)
+			}
+		}
+	}
+}
+
+func (h *ChatHub) updateUserStatus(userID uint, isOnline bool) {
+	now := time.Now()
+	update := map[string]interface{}{
+		"is_online": isOnline,
+	}
+	if !isOnline {
+		update["last_seen"] = &now
+	}
+	h.db.Model(&User{}).Where("id = ?", userID).Updates(update)
+}
+
+func (h *ChatHub) getUsernameByID(userID uint) string {
+	var user User
+	if err := h.db.First(&user, userID).Error; err != nil {
+		return "Unknown"
+	}
+	return user.Username
+}
+
+func (c *Client) readPump() {
+	defer func() {
+		c.hub.unregister <- c
+		c.conn.Close()
+	}()
+
+	c.conn.SetReadLimit(512)
+	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	for {
+		_, messageBytes, err := c.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("error: %v", err)
+			}
+			break
+		}
+
+		var wsMsg WSMessage
+		if err := json.Unmarshal(messageBytes, &wsMsg); err != nil {
+			continue
+		}
+
+		// Обрабатываем различные типы сообщений
+		switch wsMsg.Type {
+		case "chat_message":
+			c.handleChatMessage(wsMsg)
+		case "typing":
+			c.handleTyping(wsMsg)
+		case "join_room":
+			c.handleJoinRoom(wsMsg)
+		}
+	}
+}
+
+func (c *Client) writePump() {
+	ticker := time.NewTicker(54 * time.Second)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
+
+	for {
+		select {
+		case message, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if !ok {
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			w, err := c.conn.NextWriter(websocket.TextMessage)
+			if err != nil {
+				return
+			}
+			w.Write(message)
+
+			// Добавляем дополнительные сообщения из очереди
+			n := len(c.send)
+			for i := 0; i < n; i++ {
+				w.Write([]byte{'\n'})
+				w.Write(<-c.send)
+			}
+
+			if err := w.Close(); err != nil {
+				return
+			}
+
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (c *Client) handleChatMessage(wsMsg WSMessage) {
+	// Сохраняем сообщение в базу данных
+	data, ok := wsMsg.Data.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	content, _ := data["content"].(string)
+	if content == "" {
+		return
+	}
+
+	message := Message{
+		Content: content,
+		Type:    "text",
+		UserID:  c.userID,
+		RoomID:  c.roomID,
+	}
+
+	if err := c.hub.db.Create(&message).Error; err != nil {
+		log.Printf("Ошибка сохранения сообщения: %v", err)
+		return
+	}
+
+	// Загружаем пользователя для получения username
+	var user User
+	c.hub.db.First(&user, c.userID)
+
+	// Отправляем сообщение всем участникам комнаты
+	chatMsg := ChatMessage{
+		ID:        message.ID,
+		Content:   message.Content,
+		Type:      message.Type,
+		UserID:    message.UserID,
+		RoomID:    message.RoomID,
+		Username:  user.Username,
+		Avatar:    user.Avatar,
+		CreatedAt: message.CreatedAt,
+	}
+
+	response := WSMessage{
+		Type:   "new_message",
+		Data:   chatMsg,
+		RoomID: c.roomID,
+	}
+
+	c.hub.broadcastToRoom(c.roomID, response)
+}
+
+func (c *Client) handleTyping(wsMsg WSMessage) {
+	// Пересылаем индикатор печати другим пользователям в комнате
+	user := c.hub.getUsernameByID(c.userID)
+	
+	response := WSMessage{
+		Type: "typing",
+		Data: map[string]interface{}{
+			"user_id":  c.userID,
+			"username": user,
+			"is_typing": wsMsg.Data,
+		},
+		RoomID: c.roomID,
+	}
+
+	// Отправляем всем кроме отправителя
+	if clients, ok := c.hub.rooms[c.roomID]; ok {
+		messageBytes, _ := json.Marshal(response)
+		for client := range clients {
+			if client != c {
+				select {
+				case client.send <- messageBytes:
+				default:
+					close(client.send)
+					delete(c.hub.clients, client)
+					delete(c.hub.rooms[c.roomID], client)
+				}
+			}
+		}
+	}
+}
+
+func (c *Client) handleJoinRoom(wsMsg WSMessage) {
+	data, ok := wsMsg.Data.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	newRoomID, ok := data["room_id"].(float64)
+	if !ok {
+		return
+	}
+
+	// Покидаем старую комнату
+	if oldClients, ok := c.hub.rooms[c.roomID]; ok {
+		delete(oldClients, c)
+	}
+
+	// Присоединяемся к новой комнате
+	c.roomID = uint(newRoomID)
+	if _, ok := c.hub.rooms[c.roomID]; !ok {
+		c.hub.rooms[c.roomID] = make(map[*Client]bool)
+	}
+	c.hub.rooms[c.roomID][c] = true
+
+	// Уведомляем о присоединении к новой комнате
+	c.hub.broadcastToRoom(c.roomID, WSMessage{
+		Type: "user_joined",
+		Data: UserStatus{
+			UserID:   c.userID,
+			Username: c.hub.getUsernameByID(c.userID),
+			IsOnline: true,
+		},
+	})
+}
+
+// service.go
+package main
+
+import (
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+)
+
+type ChatService struct {
+	db  *gorm.DB
+	hub *ChatHub
+}
+
+func NewChatService(db *gorm.DB, hub *ChatHub) *ChatService {
+	return &ChatService{
+		db:  db,
+		hub: hub,
+	}
+}
+
+// Пользователи
+func (s *ChatService) CreateUser(c *gin.Context) {
+	var user User
+	if err := c.ShouldBindJSON(&user); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := s.db.Create(&user).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка создания пользователя"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, user)
+}
+
+func (s *ChatService) GetUsers(c *gin.Context) {
+	var users []User
+	
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "10"))
+	offset := (page - 1) * limit
+	
+	result := s.db.Offset(offset).Limit(limit).Find(&users)
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": result.Error.Error()})
+		return
+	}
+	
+	var total int64
+	s.db.Model(&User{}).Count(&total)
+	
+	c.JSON(http.StatusOK, gin.H{
+		"users": users,
+		"pagination": gin.H{
+			"page":  page,
+			"limit": limit,
+			"total": total,
+		},
+	})
+}
+
+func (s *ChatService) GetUser(c *gin.Context) {
+	id := c.Param("id")
+	var user User
+	
+	result := s.db.Preload("Rooms").First(&user, id)
+	if result.Error != nil {
+		if result.Error == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Пользователь не найден"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": result.Error.Error()})
+		return
+	}
+	
+	c.JSON(http.StatusOK, user)
+}
+
+// Комнаты
+func (s *ChatService) CreateRoom(c *gin.Context) {
+	var req struct {
+		Name        string `json:"name" binding:"required"`
+		Description string `json:"description"`
+		IsPrivate   bool   `json:"is_private"`
+		CreatedBy   uint   `json:"created_by" binding:"required"`
+	}
+	
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	room := Room{
+		Name:        req.Name,
+		Description: req.Description,
+		IsPrivate:   req.IsPrivate,
+		CreatedBy:   req.CreatedBy,
+	}
+
+	if err := s.db.Create(&room).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка создания комнаты"})
+		return
+	}
+
+	// Автоматически добавляем создателя в комнату
+	userRoom := UserRoom{
+		UserID: req.CreatedBy,
+		RoomID: room.ID,
+		Role:   "admin",
+	}
+	s.db.Create(&userRoom)
+
+	c.JSON(http.StatusCreated, room)
+}
+
+func (s *ChatService) GetRooms(c *gin.Context) {
+	var rooms []Room
+	
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "10"))
+	offset := (page - 1) * limit
+	
+	query := s.db.Offset(offset).Limit(limit)
+	
+	// Фильтр только публичных комнат, если не указан пользователь
+	userID := c.Query("user_id")
+	if userID == "" {
+		query = query.Where("is_private = ?", false)
+	}
+	
+	result := query.Find(&rooms)
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": result.Error.Error()})
+		return
+	}
+	
+	var total int64
+	s.db.Model(&Room{}).Count(&total)
+	
+	c.JSON(http.StatusOK, gin.H{
+		"rooms": rooms,
+		"pagination": gin.H{
+			"page":  page,
+			"limit": limit,
+			"total": total,
+		},
+	})
+}
+
+func (s *ChatService) GetRoom(c *gin.Context) {
+	id := c.Param("id")
+	var room Room
+	
+	result := s.db.Preload("Users").First(&room, id)
+	if result.Error != nil {
+		if result.Error == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Комната не найдена"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": result.Error.Error()})
+		return
+	}
+	
+	c.JSON(http.StatusOK, room)
+}
+
+func (s *ChatService) JoinRoom(c *gin.Context) {
+	roomID := c.Param("id")
+	var req struct {
+		UserID uint `json:"user_id" binding:"required"`
+	}
+	
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Проверяем существование комнаты и пользователя
+	var room Room
+	var user User
+	
+	if err := s.db.First(&room, roomID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Комната не найдена"})
+		return
+	}
+	
+	if err := s.db.First(&user, req.UserID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Пользователь не найден"})
+		return
+	}
+
+	// Проверяем, не состоит ли уже в комнате
+	var existingUserRoom UserRoom
+	if err := s.db.Where("user_id = ? AND room_id = ?", req.UserID, roomID).First(&existingUserRoom).Error; err == nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "Пользователь уже в комнате"})
+		return
+	}
+
+	userRoom := UserRoom{
+		UserID: req.UserID,
+		RoomID: room.ID,
+		Role:   "member",
+	}
+
+	if err := s.db.Create(&userRoom).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка присоединения к комнате"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Успешно присоединились к комнате"})
+}
+
+func (s *ChatService) LeaveRoom(c *gin.Context) {
+	roomID := c.Param("id")
+	var req struct {
+		UserID uint `json:"user_id" binding:"required"`
+	}
+	
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	result := s.db.Where("user_id = ? AND room_id = ?", req.UserID, roomID).Delete(&UserRoom{})
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": result.Error.Error()})
+		return
+	}
+
+	if result.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Пользователь не найден в комнате"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Успешно покинули комнату"})
+}
+
+func (s *ChatService) GetRoomMessages(c *gin.Context) {
+	roomID := c.Param("id")
+	
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	offset := (page - 1) * limit
+	
+	var messages []Message
+	result := s.db.Preload("User").Where("room_id = ?", roomID).
+		Order("created_at DESC").Offset(offset).Limit(limit).Find(&messages)
+	
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": result.Error.Error()})
+		return
+	}
+	
+	var total int64
+	s.db.Model(&Message{}).Where("room_id = ?", roomID).Count(&total)
+	
+	// Преобразуем в ChatMessage для клиента
+	var chatMessages []ChatMessage
+	for _, msg := range messages {
+		chatMessages = append(chatMessages, ChatMessage{
+			ID:        msg.ID,
+			Content:   msg.Content,
+			Type:      msg.Type,
+			UserID:    msg.UserID,
+			RoomID:    msg.RoomID,
+			Username:  msg.User.Username,
+			Avatar:    msg.User.Avatar,
+			CreatedAt: msg.CreatedAt,
+		})
+	}
+	
+	c.JSON(http.StatusOK, gin.H{
+		"messages": chatMessages,
+		"pagination": gin.H{
+			"page":  page,
+			"limit": limit,
+			"total": total,
+		},
+	})
+}
+
+func (s *ChatService) GetRoomUsers(c *gin.Context) {
+	roomID := c.Param("id")
+	
+	var users []User
+	result := s.db.Joins("JOIN user_rooms ON users.id = user_rooms.user_id").
+		Where("user_rooms.room_id = ?", roomID).Find(&users)
+	
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": result.Error.Error()})
+		return
+	}
+	
+	c.JSON(http.StatusOK, gin.H{"users": users})
+}
+
+func (s *ChatService) HandleWebSocket(c *gin.Context) {
+	userID, _ := strconv.ParseUint(c.Query("user_id"), 10, 32)
+	roomID, _ := strconv.ParseUint(c.Query("room_id"), 10, 32)
+	
+	if userID == 0 || roomID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id и room_id обязательны"})
+		return
+	}
+
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	client := &Client{
+		hub:    s.hub,
+		conn:   conn,
+		send:   make(chan []byte, 256),
+		userID: uint(userID),
+		roomID: uint(roomID),
