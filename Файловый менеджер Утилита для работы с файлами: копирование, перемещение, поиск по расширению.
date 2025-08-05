@@ -1,0 +1,242 @@
+// main.go
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		printUsage()
+		os.Exit(1)
+	}
+
+	command := os.Args[1]
+
+	switch command {
+	case "ls":
+		listFiles()
+	case "copy":
+		if len(os.Args) < 4 {
+			fmt.Println("Использование: filemanager copy <источник> <назначение>")
+			os.Exit(1)
+		}
+		copyFile(os.Args[2], os.Args[3])
+	case "move":
+		if len(os.Args) < 4 {
+			fmt.Println("Использование: filemanager move <источник> <назначение>")
+			os.Exit(1)
+		}
+		moveFile(os.Args[2], os.Args[3])
+	case "delete":
+		if len(os.Args) < 3 {
+			fmt.Println("Использование: filemanager delete <файл>")
+			os.Exit(1)
+		}
+		deleteFile(os.Args[2])
+	case "search":
+		if len(os.Args) < 3 {
+			fmt.Println("Использование: filemanager search <расширение> [директория]")
+			os.Exit(1)
+		}
+		extension := os.Args[2]
+		directory := "."
+		if len(os.Args) > 3 {
+			directory = os.Args[3]
+		}
+		searchByExtension(extension, directory)
+	case "info":
+		if len(os.Args) < 3 {
+			fmt.Println("Использование: filemanager info <файл>")
+			os.Exit(1)
+		}
+		showFileInfo(os.Args[2])
+	case "mkdir":
+		if len(os.Args) < 3 {
+			fmt.Println("Использование: filemanager mkdir <директория>")
+			os.Exit(1)
+		}
+		createDirectory(os.Args[2])
+	default:
+		printUsage()
+		os.Exit(1)
+	}
+}
+
+func printUsage() {
+	fmt.Println("File Manager - утилита для работы с файлами")
+	fmt.Println("\nКоманды:")
+	fmt.Println("  ls                              - Показать содержимое текущей директории")
+	fmt.Println("  copy <источник> <назначение>    - Копировать файл")
+	fmt.Println("  move <источник> <назначение>    - Переместить файл")
+	fmt.Println("  delete <файл>                   - Удалить файл")
+	fmt.Println("  search <расширение> [папка]     - Найти файлы по расширению")
+	fmt.Println("  info <файл>                     - Показать информацию о файле")
+	fmt.Println("  mkdir <директория>              - Создать директорию")
+}
+
+func listFiles() {
+	files, err := os.ReadDir(".")
+	if err != nil {
+		fmt.Printf("Ошибка чтения директории: %v\n", err)
+		return
+	}
+
+	fmt.Println("Содержимое текущей директории:")
+	fmt.Println(strings.Repeat("-", 60))
+	fmt.Printf("%-30s %-10s %-15s\n", "Имя", "Тип", "Размер")
+	fmt.Println(strings.Repeat("-", 60))
+
+	for _, file := range files {
+		info, err := file.Info()
+		if err != nil {
+			continue
+		}
+
+		fileType := "файл"
+		size := formatSize(info.Size())
+		
+		if file.IsDir() {
+			fileType = "папка"
+			size = "-"
+		}
+
+		fmt.Printf("%-30s %-10s %-15s\n", info.Name(), fileType, size)
+	}
+}
+
+func copyFile(src, dst string) {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		fmt.Printf("Ошибка открытия исходного файла: %v\n", err)
+		return
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		fmt.Printf("Ошибка создания файла назначения: %v\n", err)
+		return
+	}
+	defer destFile.Close()
+
+	bytes, err := io.Copy(destFile, sourceFile)
+	if err != nil {
+		fmt.Printf("Ошибка копирования: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Файл скопирован: %s -> %s (%s)\n", src, dst, formatSize(bytes))
+}
+
+func moveFile(src, dst string) {
+	err := os.Rename(src, dst)
+	if err != nil {
+		fmt.Printf("Ошибка перемещения файла: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Файл перемещен: %s -> %s\n", src, dst)
+}
+
+func deleteFile(filename string) {
+	info, err := os.Stat(filename)
+	if err != nil {
+		fmt.Printf("Файл не найден: %v\n", err)
+		return
+	}
+
+	err = os.Remove(filename)
+	if err != nil {
+		fmt.Printf("Ошибка удаления: %v\n", err)
+		return
+	}
+
+	fileType := "файл"
+	if info.IsDir() {
+		fileType = "директория"
+	}
+
+	fmt.Printf("Удален %s: %s\n", fileType, filename)
+}
+
+func searchByExtension(extension, directory string) {
+	if !strings.HasPrefix(extension, ".") {
+		extension = "." + extension
+	}
+
+	var foundFiles []string
+
+	err := filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Пропускаем ошибки доступа
+		}
+
+		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), strings.ToLower(extension)) {
+			foundFiles = append(foundFiles, path)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		fmt.Printf("Ошибка поиска: %v\n", err)
+		return
+	}
+
+	if len(foundFiles) == 0 {
+		fmt.Printf("Файлы с расширением %s не найдены в %s\n", extension, directory)
+		return
+	}
+
+	fmt.Printf("Найдено %d файлов с расширением %s:\n", len(foundFiles), extension)
+	fmt.Println(strings.Repeat("-", 50))
+
+	for _, file := range foundFiles {
+		info, err := os.Stat(file)
+		if err == nil {
+			fmt.Printf("%-40s %s\n", file, formatSize(info.Size()))
+		}
+	}
+}
+
+func showFileInfo(filename string) {
+	info, err := os.Stat(filename)
+	if err != nil {
+		fmt.Printf("Ошибка получения информации о файле: %v\n", err)
+		return
+	}
+
+	fmt.Println("Информация о файле:")
+	fmt.Println(strings.Repeat("-", 30))
+	fmt.Printf("Имя: %s\n", info.Name())
+	fmt.Printf("Размер: %s\n", formatSize(info.Size()))
+	fmt.Printf("Права: %s\n", info.Mode())
+	fmt.Printf("Изменен: %s\n", info.ModTime().Format("2006-01-02 15:04:05"))
+	
+	if info.IsDir() {
+		fmt.Println("Тип: Директория")
+		
+		// Подсчитать содержимое директории
+		files, err := os.ReadDir(filename)
+		if err == nil {
+			fmt.Printf("Содержит элементов: %d\n", len(files))
+		}
+	} else {
+		fmt.Println("Тип: Файл")
+		fmt.Printf("Расширение: %s\n", filepath.Ext(filename))
+	}
+
+	// Абсолютный путь
+	absPath, err := filepath.Abs(filename)
+	if err == nil {
+		fmt.Printf("Полный путь: %s\n", absPath)
+	}
+}
+
+func
