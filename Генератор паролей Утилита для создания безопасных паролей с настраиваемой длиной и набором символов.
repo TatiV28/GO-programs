@@ -1,0 +1,128 @@
+// main.go
+package main
+
+import (
+	"crypto/rand"
+	"flag"
+	"fmt"
+	"math/big"
+	"os"
+)
+
+const (
+	lowercase = "abcdefghijklmnopqrstuvwxyz"
+	uppercase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	digits    = "0123456789"
+	symbols   = "!@#$%^&*()_+-=[]{}|;:,.<>?"
+)
+
+type Config struct {
+	length      int
+	includeLower bool
+	includeUpper bool
+	includeDigits bool
+	includeSymbols bool
+}
+
+func main() {
+	config := Config{}
+	
+	flag.IntVar(&config.length, "length", 12, "Длина пароля")
+	flag.BoolVar(&config.includeLower, "lower", true, "Включить строчные буквы")
+	flag.BoolVar(&config.includeUpper, "upper", true, "Включить заглавные буквы")
+	flag.BoolVar(&config.includeDigits, "digits", true, "Включить цифры")
+	flag.BoolVar(&config.includeSymbols, "symbols", false, "Включить символы")
+	
+	flag.Parse()
+
+	if config.length <= 0 {
+		fmt.Println("Длина пароля должна быть больше 0")
+		os.Exit(1)
+	}
+
+	charset := buildCharset(config)
+	if charset == "" {
+		fmt.Println("Необходимо включить хотя бы один тип символов")
+		os.Exit(1)
+	}
+
+	password, err := generatePassword(config.length, charset)
+	if err != nil {
+		fmt.Printf("Ошибка генерации пароля: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Сгенерированный пароль: %s\n", password)
+	fmt.Printf("Длина: %d символов\n", len(password))
+	printPasswordStrength(config)
+}
+
+func buildCharset(config Config) string {
+	var charset string
+	
+	if config.includeLower {
+		charset += lowercase
+	}
+	if config.includeUpper {
+		charset += uppercase
+	}
+	if config.includeDigits {
+		charset += digits
+	}
+	if config.includeSymbols {
+		charset += symbols
+	}
+	
+	return charset
+}
+
+func generatePassword(length int, charset string) (string, error) {
+	password := make([]byte, length)
+	charsetLen := big.NewInt(int64(len(charset)))
+	
+	for i := 0; i < length; i++ {
+		randomIndex, err := rand.Int(rand.Reader, charsetLen)
+		if err != nil {
+			return "", err
+		}
+		password[i] = charset[randomIndex.Int64()]
+	}
+	
+	return string(password), nil
+}
+
+func printPasswordStrength(config Config) {
+	var charsetSize int
+	
+	if config.includeLower {
+		charsetSize += 26
+	}
+	if config.includeUpper {
+		charsetSize += 26
+	}
+	if config.includeDigits {
+		charsetSize += 10
+	}
+	if config.includeSymbols {
+		charsetSize += 32
+	}
+	
+	// Приблизительная оценка энтропии
+	entropy := float64(config.length) * (3.32193 * float64(charsetSize)) / 10
+	
+	fmt.Printf("Размер алфавита: %d символов\n", charsetSize)
+	fmt.Printf("Приблизительная энтропия: %.1f бит\n", entropy)
+	
+	if entropy < 30 {
+		fmt.Println("Сила пароля: Слабый")
+	} else if entropy < 60 {
+		fmt.Println("Сила пароля: Средний")
+	} else {
+		fmt.Println("Сила пароля: Сильный")
+	}
+}
+
+// Пример использования:
+// go run main.go -length=16 -symbols=true
+// go run main.go -length=8 -symbols=false
+// go run main.go -length=20 -lower=true -upper=true -digits=true -symbols=true
