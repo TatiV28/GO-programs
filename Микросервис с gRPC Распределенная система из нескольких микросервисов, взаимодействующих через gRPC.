@@ -1,0 +1,425 @@
+// gRPC Microservice System
+// proto/user.proto
+syntax = "proto3";
+
+package user;
+
+option go_package = "./proto";
+
+service UserService {
+  rpc GetUser(GetUserRequest) returns (GetUserResponse);
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+  rpc UpdateUser(UpdateUserRequest) returns (UpdateUserResponse);
+  rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+}
+
+message User {
+  uint32 id = 1;
+  string username = 2;
+  string email = 3;
+  string first_name = 4;
+  string last_name = 5;
+  string created_at = 6;
+  string updated_at = 7;
+}
+
+message GetUserRequest {
+  uint32 id = 1;
+}
+
+message GetUserResponse {
+  User user = 1;
+}
+
+message CreateUserRequest {
+  string username = 1;
+  string email = 2;
+  string first_name = 3;
+  string last_name = 4;
+}
+
+message CreateUserResponse {
+  User user = 1;
+}
+
+message UpdateUserRequest {
+  uint32 id = 1;
+  string username = 2;
+  string email = 3;
+  string first_name = 4;
+  string last_name = 5;
+}
+
+message UpdateUserResponse {
+  User user = 1;
+}
+
+message DeleteUserRequest {
+  uint32 id = 1;
+}
+
+message DeleteUserResponse {
+  bool success = 1;
+}
+
+message ListUsersRequest {
+  uint32 page = 1;
+  uint32 limit = 2;
+}
+
+message ListUsersResponse {
+  repeated User users = 1;
+  uint32 total = 2;
+}
+
+// proto/order.proto
+syntax = "proto3";
+
+package order;
+
+option go_package = "./proto";
+
+service OrderService {
+  rpc GetOrder(GetOrderRequest) returns (GetOrderResponse);
+  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse);
+  rpc UpdateOrderStatus(UpdateOrderStatusRequest) returns (UpdateOrderStatusResponse);
+  rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse);
+  rpc GetUserOrders(GetUserOrdersRequest) returns (GetUserOrdersResponse);
+}
+
+message Order {
+  uint32 id = 1;
+  uint32 user_id = 2;
+  string status = 3;
+  double total_amount = 4;
+  repeated OrderItem items = 5;
+  string created_at = 6;
+  string updated_at = 7;
+}
+
+message OrderItem {
+  uint32 id = 1;
+  uint32 product_id = 2;
+  string product_name = 3;
+  uint32 quantity = 4;
+  double price = 5;
+}
+
+message GetOrderRequest {
+  uint32 id = 1;
+}
+
+message GetOrderResponse {
+  Order order = 1;
+}
+
+message CreateOrderRequest {
+  uint32 user_id = 1;
+  repeated OrderItem items = 2;
+}
+
+message CreateOrderResponse {
+  Order order = 1;
+}
+
+message UpdateOrderStatusRequest {
+  uint32 id = 1;
+  string status = 2;
+}
+
+message UpdateOrderStatusResponse {
+  Order order = 1;
+}
+
+message ListOrdersRequest {
+  uint32 page = 1;
+  uint32 limit = 2;
+}
+
+message ListOrdersResponse {
+  repeated Order orders = 1;
+  uint32 total = 2;
+}
+
+message GetUserOrdersRequest {
+  uint32 user_id = 1;
+  uint32 page = 2;
+  uint32 limit = 3;
+}
+
+message GetUserOrdersResponse {
+  repeated Order orders = 1;
+  uint32 total = 2;
+}
+
+// user-service/main.go
+package main
+
+import (
+	"log"
+	"net"
+	"os"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+
+	pb "github.com/microservices/proto"
+)
+
+type server struct {
+	pb.UnimplementedUserServiceServer
+	db *gorm.DB
+}
+
+type User struct {
+	ID        uint   `gorm:"primarykey"`
+	Username  string `gorm:"uniqueIndex;not null"`
+	Email     string `gorm:"uniqueIndex;not null"`
+	FirstName string
+	LastName  string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+func main() {
+	// Подключение к базе данных
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "host=localhost user=postgres password=postgres dbname=userdb port=5432 sslmode=disable"
+	}
+
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		log.Fatalf("Ошибка подключения к базе данных: %v", err)
+	}
+
+	// Автоматическая миграция
+	db.AutoMigrate(&User{})
+
+	// Создание gRPC сервера
+	lis, err := net.Listen("tcp", ":50051")
+	if err != nil {
+		log.Fatalf("Ошибка прослушивания порта: %v", err)
+	}
+
+	s := grpc.NewServer()
+	pb.RegisterUserServiceServer(s, &server{db: db})
+	
+	// Включаем reflection для grpcurl
+	reflection.Register(s)
+
+	log.Println("User Service запущен на порту 50051")
+	if err := s.Serve(lis); err != nil {
+		log.Fatalf("Ошибка запуска сервера: %v", err)
+	}
+}
+
+func (s *server) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.GetUserResponse, error) {
+	var user User
+	if err := s.db.First(&user, req.GetId()).Error; err != nil {
+		return nil, status.Errorf(codes.NotFound, "Пользователь не найден: %v", err)
+	}
+
+	return &pb.GetUserResponse{
+		User: &pb.User{
+			Id:        uint32(user.ID),
+			Username:  user.Username,
+			Email:     user.Email,
+			FirstName: user.FirstName,
+			LastName:  user.LastName,
+			CreatedAt: user.CreatedAt.Format(time.RFC3339),
+			UpdatedAt: user.UpdatedAt.Format(time.RFC3339),
+		},
+	}, nil
+}
+
+func (s *server) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb.CreateUserResponse, error) {
+	user := User{
+		Username:  req.GetUsername(),
+		Email:     req.GetEmail(),
+		FirstName: req.GetFirstName(),
+		LastName:  req.GetLastName(),
+	}
+
+	if err := s.db.Create(&user).Error; err != nil {
+		return nil, status.Errorf(codes.Internal, "Ошибка создания пользователя: %v", err)
+	}
+
+	return &pb.CreateUserResponse{
+		User: &pb.User{
+			Id:        uint32(user.ID),
+			Username:  user.Username,
+			Email:     user.Email,
+			FirstName: user.FirstName,
+			LastName:  user.LastName,
+			CreatedAt: user.CreatedAt.Format(time.RFC3339),
+			UpdatedAt: user.UpdatedAt.Format(time.RFC3339),
+		},
+	}, nil
+}
+
+func (s *server) UpdateUser(ctx context.Context, req *pb.UpdateUserRequest) (*pb.UpdateUserResponse, error) {
+	var user User
+	if err := s.db.First(&user, req.GetId()).Error; err != nil {
+		return nil, status.Errorf(codes.NotFound, "Пользователь не найден: %v", err)
+	}
+
+	user.Username = req.GetUsername()
+	user.Email = req.GetEmail()
+	user.FirstName = req.GetFirstName()
+	user.LastName = req.GetLastName()
+
+	if err := s.db.Save(&user).Error; err != nil {
+		return nil, status.Errorf(codes.Internal, "Ошибка обновления пользователя: %v", err)
+	}
+
+	return &pb.UpdateUserResponse{
+		User: &pb.User{
+			Id:        uint32(user.ID),
+			Username:  user.Username,
+			Email:     user.Email,
+			FirstName: user.FirstName,
+			LastName:  user.LastName,
+			CreatedAt: user.CreatedAt.Format(time.RFC3339),
+			UpdatedAt: user.UpdatedAt.Format(time.RFC3339),
+		},
+	}, nil
+}
+
+func (s *server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*pb.DeleteUserResponse, error) {
+	result := s.db.Delete(&User{}, req.GetId())
+	if result.Error != nil {
+		return nil, status.Errorf(codes.Internal, "Ошибка удаления пользователя: %v", result.Error)
+	}
+
+	return &pb.DeleteUserResponse{
+		Success: result.RowsAffected > 0,
+	}, nil
+}
+
+func (s *server) ListUsers(ctx context.Context, req *pb.ListUsersRequest) (*pb.ListUsersResponse, error) {
+	var users []User
+	var total int64
+
+	page := req.GetPage()
+	if page == 0 {
+		page = 1
+	}
+	limit := req.GetLimit()
+	if limit == 0 {
+		limit = 10
+	}
+
+	offset := (page - 1) * limit
+
+	s.db.Model(&User{}).Count(&total)
+	if err := s.db.Offset(int(offset)).Limit(int(limit)).Find(&users).Error; err != nil {
+		return nil, status.Errorf(codes.Internal, "Ошибка получения списка пользователей: %v", err)
+	}
+
+	var pbUsers []*pb.User
+	for _, user := range users {
+		pbUsers = append(pbUsers, &pb.User{
+			Id:        uint32(user.ID),
+			Username:  user.Username,
+			Email:     user.Email,
+			FirstName: user.FirstName,
+			LastName:  user.LastName,
+			CreatedAt: user.CreatedAt.Format(time.RFC3339),
+			UpdatedAt: user.UpdatedAt.Format(time.RFC3339),
+		})
+	}
+
+	return &pb.ListUsersResponse{
+		Users: pbUsers,
+		Total: uint32(total),
+	}, nil
+}
+
+// order-service/main.go
+package main
+
+import (
+	"context"
+	"log"
+	"net"
+	"os"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/status"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+
+	pb "github.com/microservices/proto"
+)
+
+type server struct {
+	pb.UnimplementedOrderServiceServer
+	db         *gorm.DB
+	userClient pb.UserServiceClient
+}
+
+type Order struct {
+	ID          uint        `gorm:"primarykey"`
+	UserID      uint        `gorm:"not null"`
+	Status      string      `gorm:"default:pending"`
+	TotalAmount float64     `gorm:"not null"`
+	Items       []OrderItem `gorm:"foreignKey:OrderID"`
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+type OrderItem struct {
+	ID          uint    `gorm:"primarykey"`
+	OrderID     uint    `gorm:"not null"`
+	ProductID   uint    `gorm:"not null"`
+	ProductName string  `gorm:"not null"`
+	Quantity    uint    `gorm:"not null"`
+	Price       float64 `gorm:"not null"`
+}
+
+func main() {
+	// Подключение к базе данных
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "host=localhost user=postgres password=postgres dbname=orderdb port=5432 sslmode=disable"
+	}
+
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		log.Fatalf("Ошибка подключения к базе данных: %v", err)
+	}
+
+	// Автоматическая миграция
+	db.AutoMigrate(&Order{}, &OrderItem{})
+
+	// Подключение к User Service
+	userConn, err := grpc.Dial("user-service:50051", grpc.WithInsecure())
+	if err != nil {
+		log.Fatalf("Ошибка подключения к User Service: %v", err)
+	}
+	defer userConn.Close()
+
+	userClient := pb.NewUserServiceClient(userConn)
+
+	// Создание gRPC сервера
+	lis, err := net.Listen("tcp", ":50052")
+	if err != nil {
+		log.Fatalf("Ошибка прослушивания порта: %v", err)
+	}
+
+	s := grpc.NewServer()
+	pb.RegisterOrderServiceServer(s, &server{
+		db:         db,
+		userClient: userClient,
+	})
+	
+	reflection.Register(s)
+
+	log.Println("Order Service запущен на пор
