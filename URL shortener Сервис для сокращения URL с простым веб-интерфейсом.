@@ -1,0 +1,477 @@
+package main
+
+import (
+	"crypto/rand"
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+)
+
+type URLEntry struct {
+	ID          string    `json:"id"`
+	OriginalURL string    `json:"original_url"`
+	ShortCode   string    `json:"short_code"`
+	CreatedAt   time.Time `json:"created_at"`
+	Clicks      int       `json:"clicks"`
+	LastAccess  *time.Time `json:"last_access,omitempty"`
+}
+
+type URLShortener struct {
+	storage  map[string]*URLEntry
+	baseURL  string
+	filename string
+}
+
+type APIResponse struct {
+	Success   bool        `json:"success"`
+	Data      interface{} `json:"data,omitempty"`
+	Error     string      `json:"error,omitempty"`
+}
+
+func NewURLShortener(baseURL, filename string) *URLShortener {
+	us := &URLShortener{
+		storage:  make(map[string]*URLEntry),
+		baseURL:  baseURL,
+		filename: filename,
+	}
+	us.loadFromFile()
+	return us
+}
+
+func main() {
+	port := "8080"
+	baseURL := "http://localhost:8080"
+	
+	if len(os.Args) > 1 {
+		port = os.Args[1]
+	}
+	if len(os.Args) > 2 {
+		baseURL = os.Args[2]
+	}
+
+	shortener := NewURLShortener(baseURL, "urls.json")
+	
+	fmt.Println("🔗 URL Shortener")
+	fmt.Printf("🚀 Запуск сервера на порту %s\n", port)
+	fmt.Printf("🌍 Базовый URL: %s\n", baseURL)
+	fmt.Printf("💾 Файл хранения: urls.json\n")
+	fmt.Printf("%s\n", strings.Repeat("-", 50))
+
+	http.HandleFunc("/", shortener.handleHome)
+	http.HandleFunc("/api/shorten", shortener.handleAPIShorten)
+	http.HandleFunc("/api/stats/", shortener.handleAPIStats)
+	http.HandleFunc("/api/list", shortener.handleAPIList)
+	http.HandleFunc("/s/", shortener.handleRedirect)
+	http.HandleFunc("/stats/", shortener.handleStats)
+
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+func (us *URLShortener) handleHome(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+
+	tmpl := `<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔗 URL Shortener</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+        .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #333; }
+        .form-group { margin: 20px 0; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input[type="url"] { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 16px; }
+        button { background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
+        button:hover { background: #0056b3; }
+        .result { margin: 20px 0; padding: 15px; background: #d4edda; border-radius: 5px; display: none; }
+        .error { background: #f8d7da; color: #721c24; }
+        .stats { background: #e8f4fd; padding: 15px; border-radius: 5px; margin: 20px 0; }
+        .url-list { margin: 20px 0; }
+        .url-item { padding: 10px; border: 1px solid #eee; margin: 5px 0; border-radius: 5px; }
+        .short-url { font-weight: bold; color: #007bff; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔗 URL Shortener</h1>
+        
+        <form id="shortenForm">
+            <div class="form-group">
+                <label for="url">🌐 Введите URL для сокращения:</label>
+                <input type="url" id="url" name="url" placeholder="https://example.com" required>
+            </div>
+            <button type="submit">✂️ Сократить URL</button>
+        </form>
+
+        <div id="result" class="result"></div>
+
+        <div class="stats">
+            <h3>📊 Статистика</h3>
+            <p>📈 Всего ссылок: <span id="totalUrls">{{.TotalUrls}}</span></p>
+            <p>👆 Всего кликов: <span id="totalClicks">{{.TotalClicks}}</span></p>
+        </div>
+
+        <div class="stats">
+            <h3>🔗 API Endpoints</h3>
+            <p>📝 POST /api/shorten - Сократить URL</p>
+            <p>📊 GET /api/stats/{code} - Статистика по коду</p>
+            <p>📋 GET /api/list - Список всех URL</p>
+            <p>🔄 GET /s/{code} - Редирект на оригинальный URL</p>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('shortenForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const url = document.getElementById('url').value;
+            const resultDiv = document.getElementById('result');
+            
+            try {
+                const response = await fetch('/api/shorten', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ url: url })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    resultDiv.className = 'result';
+                    resultDiv.innerHTML = ` + "`" + `
+                        <h3>✅ URL успешно сокращен!</h3>
+                        <p><strong>Оригинальный URL:</strong> ${data.data.original_url}</p>
+                        <p><strong>Короткий URL:</strong> <a href="${data.data.short_url}" class="short-url">${data.data.short_url}</a></p>
+                        <p><strong>Код:</strong> ${data.data.short_code}</p>
+                        <p><strong>Статистика:</strong> <a href="/stats/${data.data.short_code}">Просмотреть</a></p>
+                    ` + "`" + `;
+                } else {
+                    resultDiv.className = 'result error';
+                    resultDiv.innerHTML = ` + "`" + `<h3>❌ Ошибка</h3><p>${data.error}</p>` + "`" + `;
+                }
+                
+                resultDiv.style.display = 'block';
+                
+            } catch (error) {
+                resultDiv.className = 'result error';
+                resultDiv.innerHTML = ` + "`" + `<h3>❌ Ошибка</h3><p>Произошла ошибка при сокращении URL</p>` + "`" + `;
+                resultDiv.style.display = 'block';
+            }
+        });
+    </script>
+</body>
+</html>`
+
+	t, _ := template.New("home").Parse(tmpl)
+	
+	stats := us.getGlobalStats()
+	data := struct {
+		TotalUrls   int
+		TotalClicks int
+	}{
+		TotalUrls:   len(us.storage),
+		TotalClicks: stats["total_clicks"].(int),
+	}
+	
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	t.Execute(w, data)
+}
+
+func (us *URLShortener) handleAPIShorten(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		us.writeError(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var request struct {
+		URL string `json:"url"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		us.writeError(w, "Неверный JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Валидация URL
+	if request.URL == "" {
+		us.writeError(w, "URL не может быть пустым", http.StatusBadRequest)
+		return
+	}
+
+	parsedURL, err := url.Parse(request.URL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		us.writeError(w, "Неверный URL. Используйте http:// или https://", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем, не существует ли уже такой URL
+	for _, entry := range us.storage {
+		if entry.OriginalURL == request.URL {
+			response := map[string]interface{}{
+				"original_url": entry.OriginalURL,
+				"short_url":    fmt.Sprintf("%s/s/%s", us.baseURL, entry.ShortCode),
+				"short_code":   entry.ShortCode,
+				"created_at":   entry.CreatedAt,
+				"clicks":       entry.Clicks,
+			}
+			us.writeSuccess(w, response)
+			return
+		}
+	}
+
+	// Создаем новую запись
+	shortCode := us.generateShortCode()
+	entry := &URLEntry{
+		ID:          us.generateID(),
+		OriginalURL: request.URL,
+		ShortCode:   shortCode,
+		CreatedAt:   time.Now(),
+		Clicks:      0,
+	}
+
+	us.storage[shortCode] = entry
+	us.saveToFile()
+
+	response := map[string]interface{}{
+		"original_url": entry.OriginalURL,
+		"short_url":    fmt.Sprintf("%s/s/%s", us.baseURL, entry.ShortCode),
+		"short_code":   entry.ShortCode,
+		"created_at":   entry.CreatedAt,
+		"clicks":       entry.Clicks,
+	}
+
+	fmt.Printf("✅ Создан короткий URL: %s -> %s/s/%s\n", request.URL, us.baseURL, shortCode)
+	us.writeSuccess(w, response)
+}
+
+func (us *URLShortener) handleRedirect(w http.ResponseWriter, r *http.Request) {
+	shortCode := strings.TrimPrefix(r.URL.Path, "/s/")
+	
+	entry, exists := us.storage[shortCode]
+	if !exists {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Обновляем статистику
+	entry.Clicks++
+	now := time.Now()
+	entry.LastAccess = &now
+	us.saveToFile()
+
+	fmt.Printf("🔄 Редирект: %s -> %s (клик #%d)\n", shortCode, entry.OriginalURL, entry.Clicks)
+	http.Redirect(w, r, entry.OriginalURL, http.StatusFound)
+}
+
+func (us *URLShortener) handleAPIStats(w http.ResponseWriter, r *http.Request) {
+	shortCode := strings.TrimPrefix(r.URL.Path, "/api/stats/")
+	
+	entry, exists := us.storage[shortCode]
+	if !exists {
+		us.writeError(w, "Короткий URL не найден", http.StatusNotFound)
+		return
+	}
+
+	stats := map[string]interface{}{
+		"short_code":   entry.ShortCode,
+		"original_url": entry.OriginalURL,
+		"created_at":   entry.CreatedAt,
+		"clicks":       entry.Clicks,
+		"last_access":  entry.LastAccess,
+		"short_url":    fmt.Sprintf("%s/s/%s", us.baseURL, entry.ShortCode),
+	}
+
+	us.writeSuccess(w, stats)
+}
+
+func (us *URLShortener) handleAPIList(w http.ResponseWriter, r *http.Request) {
+	var urls []map[string]interface{}
+	
+	for _, entry := range us.storage {
+		urlData := map[string]interface{}{
+			"short_code":   entry.ShortCode,
+			"original_url": entry.OriginalURL,
+			"short_url":    fmt.Sprintf("%s/s/%s", us.baseURL, entry.ShortCode),
+			"created_at":   entry.CreatedAt,
+			"clicks":       entry.Clicks,
+			"last_access":  entry.LastAccess,
+		}
+		urls = append(urls, urlData)
+	}
+
+	us.writeSuccess(w, urls)
+}
+
+func (us *URLShortener) handleStats(w http.ResponseWriter, r *http.Request) {
+	shortCode := strings.TrimPrefix(r.URL.Path, "/stats/")
+	
+	entry, exists := us.storage[shortCode]
+	if !exists {
+		http.NotFound(w, r)
+		return
+	}
+
+	tmpl := `<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>📊 Статистика - {{.ShortCode}}</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }
+        .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .stat { margin: 15px 0; padding: 10px; background: #f8f9fa; border-radius: 5px; }
+        .url { word-break: break-all; }
+        a { color: #007bff; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 Статистика короткого URL</h1>
+        
+        <div class="stat">
+            <strong>🔗 Короткий код:</strong> {{.ShortCode}}
+        </div>
+        
+        <div class="stat">
+            <strong>🌐 Оригинальный URL:</strong><br>
+            <div class="url"><a href="{{.OriginalURL}}" target="_blank">{{.OriginalURL}}</a></div>
+        </div>
+        
+        <div class="stat">
+            <strong>📎 Короткий URL:</strong><br>
+            <div class="url"><a href="{{.ShortURL}}">{{.ShortURL}}</a></div>
+        </div>
+        
+        <div class="stat">
+            <strong>📅 Создан:</strong> {{.CreatedAt}}
+        </div>
+        
+        <div class="stat">
+            <strong>👆 Количество кликов:</strong> {{.Clicks}}
+        </div>
+        
+        {{if .LastAccess}}
+        <div class="stat">
+            <strong>⏰ Последний доступ:</strong> {{.LastAccess}}
+        </div>
+        {{end}}
+        
+        <p><a href="/">← Вернуться на главную</a></p>
+    </div>
+</body>
+</html>`
+
+	t, _ := template.New("stats").Parse(tmpl)
+	
+	data := struct {
+		ShortCode   string
+		OriginalURL string
+		ShortURL    string
+		CreatedAt   string
+		Clicks      int
+		LastAccess  string
+	}{
+		ShortCode:   entry.ShortCode,
+		OriginalURL: entry.OriginalURL,
+		ShortURL:    fmt.Sprintf("%s/s/%s", us.baseURL, entry.ShortCode),
+		CreatedAt:   entry.CreatedAt.Format("2006-01-02 15:04:05"),
+		Clicks:      entry.Clicks,
+	}
+	
+	if entry.LastAccess != nil {
+		data.LastAccess = entry.LastAccess.Format("2006-01-02 15:04:05")
+	}
+	
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	t.Execute(w, data)
+}
+
+func (us *URLShortener) generateShortCode() string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	const length = 6
+	
+	for {
+		b := make([]byte, length)
+		for i := range b {
+			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+			b[i] = charset[n.Int64()]
+		}
+		
+		code := string(b)
+		if _, exists := us.storage[code]; !exists {
+			return code
+		}
+	}
+}
+
+func (us *URLShortener) generateID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return fmt.Sprintf("%x", b)
+}
+
+func (us *URLShortener) getGlobalStats() map[string]interface{} {
+	totalClicks := 0
+	for _, entry := range us.storage {
+		totalClicks += entry.Clicks
+	}
+	
+	return map[string]interface{}{
+		"total_urls":   len(us.storage),
+		"total_clicks": totalClicks,
+	}
+}
+
+func (us *URLShortener) writeSuccess(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	json.NewEncoder(w).Encode(APIResponse{
+		Success: true,
+		Data:    data,
+	})
+}
+
+func (us *URLShortener) writeError(w http.ResponseWriter, message string, statusCode int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(APIResponse{
+		Success: false,
+		Error:   message,
+	})
+}
+
+func (us *URLShortener) saveToFile() {
+	data, err := json.MarshalIndent(us.storage, "", "  ")
+	if err != nil {
+		fmt.Printf("❌ Ошибка сохранения: %v\n", err)
+		return
+	}
+	
+	os.WriteFile(us.filename, data, 0644)
+}
+
+func (us *URLShortener) loadFromFile() {
+	data, err := os.ReadFile(us.filename)
+	if err != nil {
+		return // Файл не существует - это нормально
+	}
+	
+	err = json.Unmarshal(data, &us.storage)
+	if err != nil {
+		fmt.Printf("❌ Ошибка загрузки: %v\n", err)
+	}
+}
