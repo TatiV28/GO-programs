@@ -1,0 +1,1500 @@
+// cmd/main.go
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
+	"taskscheduler/internal/config"
+	"taskscheduler/internal/database"
+	"taskscheduler/internal/handlers"
+	"taskscheduler/internal/scheduler"
+	"taskscheduler/internal/worker"
+)
+
+func main() {
+	// Load environment variables
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found")
+	}
+
+	cfg := config.Load()
+
+	// Initialize database
+	db, err := database.Connect(cfg.DatabaseURL)
+	if err != nil {
+		log.Fatal("Failed to connect to database:", err)
+	}
+	defer db.Close()
+
+	// Initialize scheduler
+	sched := scheduler.New(db)
+	
+	// Initialize worker pool
+	workerPool := worker.NewPool(cfg.WorkerCount, db)
+	
+	// Start scheduler and workers
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	
+	go sched.Start(ctx)
+	go workerPool.Start(ctx)
+
+	// Setup HTTP server
+	router := gin.Default()
+	h := handlers.New(db, sched)
+	
+	// Routes
+	v1 := router.Group("/api/v1")
+	{
+		v1.POST("/tasks", h.CreateTask)
+		v1.GET("/tasks", h.ListTasks)
+		v1.GET("/tasks/:id", h.GetTask)
+		v1.PUT("/tasks/:id", h.UpdateTask)
+		v1.DELETE("/tasks/:id", h.DeleteTask)
+		v1.POST("/tasks/:id/run", h.RunTaskNow)
+		
+		v1.GET("/schedules", h.ListSchedules)
+		v1.POST("/schedules", h.CreateSchedule)
+		v1.PUT("/schedules/:id", h.UpdateSchedule)
+		v1.DELETE("/schedules/:id", h.DeleteSchedule)
+		
+		v1.GET("/executions", h.ListExecutions)
+		v1.GET("/executions/:id", h.GetExecution)
+		
+		v1.GET("/health", h.HealthCheck)
+		v1.GET("/metrics", h.GetMetrics)
+	}
+
+	server := &http.Server{
+		Addr:    ":" + cfg.Port,
+		Handler: router,
+	}
+
+	// Graceful shutdown
+	go func() {
+		log.Printf("Server starting on port %s", cfg.Port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal("Server failed to start:", err)
+		}
+	}()
+
+	// Wait for interrupt signal
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down server...")
+	
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Fatal("Server forced to shutdown:", err)
+	}
+	
+	cancel() // Stop scheduler and workers
+	log.Println("Server exited")
+}
+
+// internal/config/config.go
+package config
+
+import (
+	"os"
+	"strconv"
+)
+
+type Config struct {
+	Port        string
+	DatabaseURL string
+	WorkerCount int
+	RedisURL    string
+}
+
+func Load() *Config {
+	workerCount, _ := strconv.Atoi(getEnv("WORKER_COUNT", "5"))
+	
+	return &Config{
+		Port:        getEnv("PORT", "8080"),
+		DatabaseURL: getEnv("DATABASE_URL", "postgres://user:password@localhost/taskscheduler?sslmode=disable"),
+		WorkerCount: workerCount,
+		RedisURL:    getEnv("REDIS_URL", "redis://localhost:6379"),
+	}
+}
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// internal/models/models.go
+package models
+
+import (
+	"encoding/json"
+	"time"
+)
+
+type Task struct {
+	ID          int64     `json:"id" db:"id"`
+	Name        string    `json:"name" db:"name"`
+	Description string    `json:"description" db:"description"`
+	Type        string    `json:"type" db:"type"` // "http", "shell", "function"
+	Config      TaskConfig `json:"config" db:"config"`
+	Status      string    `json:"status" db:"status"` // "active", "inactive", "paused"
+	CreatedAt   time.Time `json:"createdAt" db:"created_at"`
+	UpdatedAt   time.Time `json:"updatedAt" db:"updated_at"`
+}
+
+type TaskConfig struct {
+	URL         string            `json:"url,omitempty"`
+	Method      string            `json:"method,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Body        string            `json:"body,omitempty"`
+	Command     string            `json:"command,omitempty"`
+	Args        []string          `json:"args,omitempty"`
+	Function    string            `json:"function,omitempty"`
+	Timeout     int               `json:"timeout,omitempty"`
+	Retries     int               `json:"retries,omitempty"`
+	RetryDelay  int               `json:"retryDelay,omitempty"`
+}
+
+type Schedule struct {
+	ID          int64     `json:"id" db:"id"`
+	TaskID      int64     `json:"taskId" db:"task_id"`
+	Name        string    `json:"name" db:"name"`
+	CronExpr    string    `json:"cronExpr" db:"cron_expr"`
+	Timezone    string    `json:"timezone" db:"timezone"`
+	Enabled     bool      `json:"enabled" db:"enabled"`
+	NextRun     *time.Time `json:"nextRun" db:"next_run"`
+	LastRun     *time.Time `json:"lastRun" db:"last_run"`
+	CreatedAt   time.Time `json:"createdAt" db:"created_at"`
+	UpdatedAt   time.Time `json:"updatedAt" db:"updated_at"`
+}
+
+type TaskExecution struct {
+	ID          int64     `json:"id" db:"id"`
+	TaskID      int64     `json:"taskId" db:"task_id"`
+	ScheduleID  *int64    `json:"scheduleId" db:"schedule_id"`
+	Status      string    `json:"status" db:"status"` // "queued", "running", "completed", "failed", "cancelled"
+	StartedAt   *time.Time `json:"startedAt" db:"started_at"`
+	CompletedAt *time.Time `json:"completedAt" db:"completed_at"`
+	Output      string    `json:"output" db:"output"`
+	Error       string    `json:"error" db:"error"`
+	Duration    int64     `json:"duration" db:"duration"` // in milliseconds
+	Attempts    int       `json:"attempts" db:"attempts"`
+	CreatedAt   time.Time `json:"createdAt" db:"created_at"`
+}
+
+type QueuedJob struct {
+	ID           int64     `json:"id"`
+	TaskID       int64     `json:"taskId"`
+	ScheduleID   *int64    `json:"scheduleId"`
+	ExecutionID  int64     `json:"executionId"`
+	Priority     int       `json:"priority"`
+	ScheduledFor time.Time `json:"scheduledFor"`
+	CreatedAt    time.Time `json:"createdAt"`
+}
+
+// internal/database/database.go
+package database
+
+import (
+	"database/sql"
+	"fmt"
+
+	"github.com/jmoiron/sqlx"
+	_ "github.com/lib/pq"
+)
+
+func Connect(databaseURL string) (*sqlx.DB, error) {
+	db, err := sqlx.Connect("postgres", databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	// Run migrations
+	if err := runMigrations(db); err != nil {
+		return nil, fmt.Errorf("failed to run migrations: %w", err)
+	}
+
+	return db, nil
+}
+
+func runMigrations(db *sqlx.DB) error {
+	migrations := []string{
+		`CREATE TABLE IF NOT EXISTS tasks (
+			id SERIAL PRIMARY KEY,
+			name VARCHAR(255) NOT NULL,
+			description TEXT,
+			type VARCHAR(50) NOT NULL,
+			config JSONB NOT NULL,
+			status VARCHAR(20) DEFAULT 'active',
+			created_at TIMESTAMP DEFAULT NOW(),
+			updated_at TIMESTAMP DEFAULT NOW()
+		)`,
+		
+		`CREATE TABLE IF NOT EXISTS schedules (
+			id SERIAL PRIMARY KEY,
+			task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+			name VARCHAR(255) NOT NULL,
+			cron_expr VARCHAR(100) NOT NULL,
+			timezone VARCHAR(50) DEFAULT 'UTC',
+			enabled BOOLEAN DEFAULT true,
+			next_run TIMESTAMP,
+			last_run TIMESTAMP,
+			created_at TIMESTAMP DEFAULT NOW(),
+			updated_at TIMESTAMP DEFAULT NOW()
+		)`,
+		
+		`CREATE TABLE IF NOT EXISTS task_executions (
+			id SERIAL PRIMARY KEY,
+			task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+			schedule_id INTEGER REFERENCES schedules(id) ON DELETE SET NULL,
+			status VARCHAR(20) DEFAULT 'queued',
+			started_at TIMESTAMP,
+			completed_at TIMESTAMP,
+			output TEXT,
+			error TEXT,
+			duration BIGINT DEFAULT 0,
+			attempts INTEGER DEFAULT 0,
+			created_at TIMESTAMP DEFAULT NOW()
+		)`,
+		
+		`CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(next_run) WHERE enabled = true`,
+		`CREATE INDEX IF NOT EXISTS idx_executions_status ON task_executions(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_executions_created_at ON task_executions(created_at)`,
+	}
+
+	for _, migration := range migrations {
+		if _, err := db.Exec(migration); err != nil {
+			return fmt.Errorf("failed to execute migration: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// internal/scheduler/scheduler.go
+package scheduler
+
+import (
+	"context"
+	"log"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	"github.com/robfig/cron/v3"
+	"taskscheduler/internal/models"
+	"taskscheduler/internal/queue"
+)
+
+type Scheduler struct {
+	db    *sqlx.DB
+	cron  *cron.Cron
+	queue *queue.Queue
+}
+
+func New(db *sqlx.DB) *Scheduler {
+	c := cron.New(cron.WithSeconds())
+	q := queue.New(db)
+	
+	return &Scheduler{
+		db:    db,
+		cron:  c,
+		queue: q,
+	}
+}
+
+func (s *Scheduler) Start(ctx context.Context) {
+	log.Println("Starting scheduler...")
+	
+	// Load existing schedules
+	if err := s.loadSchedules(); err != nil {
+		log.Printf("Error loading schedules: %v", err)
+	}
+	
+	s.cron.Start()
+	
+	// Periodic schedule reload
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Stopping scheduler...")
+			s.cron.Stop()
+			return
+		case <-ticker.C:
+			if err := s.loadSchedules(); err != nil {
+				log.Printf("Error reloading schedules: %v", err)
+			}
+		}
+	}
+}
+
+func (s *Scheduler) loadSchedules() error {
+	var schedules []models.Schedule
+	err := s.db.Select(&schedules, 
+		"SELECT * FROM schedules WHERE enabled = true")
+	if err != nil {
+		return err
+	}
+
+	// Clear existing cron jobs
+	for _, entry := range s.cron.Entries() {
+		s.cron.Remove(entry.ID)
+	}
+
+	// Add schedules to cron
+	for _, schedule := range schedules {
+		schedule := schedule // capture loop variable
+		
+		_, err := s.cron.AddFunc(schedule.CronExpr, func() {
+			if err := s.scheduleTask(schedule.TaskID, &schedule.ID); err != nil {
+				log.Printf("Error scheduling task %d: %v", schedule.TaskID, err)
+			}
+		})
+		
+		if err != nil {
+			log.Printf("Error adding schedule %d to cron: %v", schedule.ID, err)
+			continue
+		}
+		
+		// Update next run time
+		if err := s.updateNextRun(schedule.ID); err != nil {
+			log.Printf("Error updating next run for schedule %d: %v", schedule.ID, err)
+		}
+	}
+	
+	return nil
+}
+
+func (s *Scheduler) scheduleTask(taskID int64, scheduleID *int64) error {
+	// Create execution record
+	execution := &models.TaskExecution{
+		TaskID:     taskID,
+		ScheduleID: scheduleID,
+		Status:     "queued",
+		CreatedAt:  time.Now(),
+	}
+	
+	err := s.db.QueryRow(`
+		INSERT INTO task_executions (task_id, schedule_id, status, created_at)
+		VALUES ($1, $2, $3, $4) RETURNING id`,
+		execution.TaskID, execution.ScheduleID, execution.Status, execution.CreatedAt,
+	).Scan(&execution.ID)
+	
+	if err != nil {
+		return err
+	}
+	
+	// Queue the job
+	return s.queue.Enqueue(&models.QueuedJob{
+		TaskID:       taskID,
+		ScheduleID:   scheduleID,
+		ExecutionID:  execution.ID,
+		Priority:     1,
+		ScheduledFor: time.Now(),
+		CreatedAt:    time.Now(),
+	})
+}
+
+func (s *Scheduler) updateNextRun(scheduleID int64) error {
+	// This would calculate the next run time based on cron expression
+	// For simplicity, we'll update it to now + 1 minute
+	_, err := s.db.Exec(`
+		UPDATE schedules SET next_run = NOW() + INTERVAL '1 minute'
+		WHERE id = $1`, scheduleID)
+	return err
+}
+
+func (s *Scheduler) ScheduleTaskNow(taskID int64) error {
+	return s.scheduleTask(taskID, nil)
+}
+
+// internal/queue/queue.go
+package queue
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+
+	"github.com/jmoiron/sqlx"
+	"taskscheduler/internal/models"
+)
+
+type Queue struct {
+	db *sqlx.DB
+}
+
+func New(db *sqlx.DB) *Queue {
+	return &Queue{db: db}
+}
+
+func (q *Queue) Enqueue(job *models.QueuedJob) error {
+	// For simplicity, we'll use the database as a queue
+	// In production, you might want to use Redis or RabbitMQ
+	
+	jobData, err := json.Marshal(job)
+	if err != nil {
+		return err
+	}
+	
+	_, err = q.db.Exec(`
+		INSERT INTO queue (job_data, priority, scheduled_for, created_at)
+		VALUES ($1, $2, $3, $4)`,
+		jobData, job.Priority, job.ScheduledFor, job.CreatedAt)
+	
+	return err
+}
+
+func (q *Queue) Dequeue() (*models.QueuedJob, error) {
+	var jobData string
+	err := q.db.QueryRow(`
+		DELETE FROM queue 
+		WHERE id = (
+			SELECT id FROM queue 
+			WHERE scheduled_for <= NOW() 
+			ORDER BY priority DESC, created_at ASC 
+			LIMIT 1
+		) 
+		RETURNING job_data`).Scan(&jobData)
+	
+	if err != nil {
+		return nil, err
+	}
+	
+	var job models.QueuedJob
+	if err := json.Unmarshal([]byte(jobData), &job); err != nil {
+		return nil, err
+	}
+	
+	return &job, nil
+}
+
+// Create queue table migration
+func (q *Queue) CreateTable() error {
+	_, err := q.db.Exec(`
+		CREATE TABLE IF NOT EXISTS queue (
+			id SERIAL PRIMARY KEY,
+			job_data JSONB NOT NULL,
+			priority INTEGER DEFAULT 1,
+			scheduled_for TIMESTAMP DEFAULT NOW(),
+			created_at TIMESTAMP DEFAULT NOW()
+		)`)
+	return err
+}
+
+// internal/worker/worker.go
+package worker
+
+import (
+	"context"
+	"database/sql"
+	"log"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	"taskscheduler/internal/executor"
+	"taskscheduler/internal/models"
+	"taskscheduler/internal/queue"
+)
+
+type Pool struct {
+	workerCount int
+	db          *sqlx.DB
+	queue       *queue.Queue
+	executor    *executor.Executor
+}
+
+func NewPool(workerCount int, db *sqlx.DB) *Pool {
+	return &Pool{
+		workerCount: workerCount,
+		db:          db,
+		queue:       queue.New(db),
+		executor:    executor.New(),
+	}
+}
+
+func (p *Pool) Start(ctx context.Context) {
+	log.Printf("Starting %d workers...", p.workerCount)
+	
+	// Ensure queue table exists
+	if err := p.queue.CreateTable(); err != nil {
+		log.Printf("Error creating queue table: %v", err)
+	}
+	
+	for i := 0; i < p.workerCount; i++ {
+		go p.worker(ctx, i)
+	}
+}
+
+func (p *Pool) worker(ctx context.Context, id int) {
+	log.Printf("Worker %d started", id)
+	
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Worker %d stopping", id)
+			return
+		case <-ticker.C:
+			if err := p.processJob(id); err != nil && err != sql.ErrNoRows {
+				log.Printf("Worker %d error: %v", id, err)
+			}
+		}
+	}
+}
+
+func (p *Pool) processJob(workerID int) error {
+	// Dequeue job
+	job, err := p.queue.Dequeue()
+	if err != nil {
+		return err
+	}
+	
+	log.Printf("Worker %d processing job for task %d", workerID, job.TaskID)
+	
+	// Get task details
+	var task models.Task
+	err = p.db.Get(&task, "SELECT * FROM tasks WHERE id = $1", job.TaskID)
+	if err != nil {
+		return p.updateExecutionError(job.ExecutionID, "Task not found")
+	}
+	
+	// Update execution status
+	if err := p.updateExecutionStatus(job.ExecutionID, "running"); err != nil {
+		return err
+	}
+	
+	// Execute task
+	startTime := time.Now()
+	result, err := p.executor.Execute(&task)
+	duration := time.Since(startTime)
+	
+	if err != nil {
+		return p.updateExecutionError(job.ExecutionID, err.Error())
+	}
+	
+	// Update execution with success
+	return p.updateExecutionSuccess(job.ExecutionID, result, duration)
+}
+
+func (p *Pool) updateExecutionStatus(executionID int64, status string) error {
+	_, err := p.db.Exec(`
+		UPDATE task_executions 
+		SET status = $1, started_at = CASE WHEN $1 = 'running' THEN NOW() ELSE started_at END
+		WHERE id = $2`,
+		status, executionID)
+	return err
+}
+
+func (p *Pool) updateExecutionError(executionID int64, errorMsg string) error {
+	_, err := p.db.Exec(`
+		UPDATE task_executions 
+		SET status = 'failed', completed_at = NOW(), error = $1, 
+		    duration = EXTRACT(EPOCH FROM (NOW() - started_at)) * 1000
+		WHERE id = $2`,
+		errorMsg, executionID)
+	return err
+}
+
+func (p *Pool) updateExecutionSuccess(executionID int64, output string, duration time.Duration) error {
+	_, err := p.db.Exec(`
+		UPDATE task_executions 
+		SET status = 'completed', completed_at = NOW(), output = $1, duration = $2
+		WHERE id = $3`,
+		output, duration.Milliseconds(), executionID)
+	return err
+}
+
+// internal/executor/executor.go
+package executor
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os/exec"
+	"strings"
+	"time"
+
+	"taskscheduler/internal/models"
+)
+
+type Executor struct {
+	httpClient *http.Client
+}
+
+func New() *Executor {
+	return &Executor{
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+}
+
+func (e *Executor) Execute(task *models.Task) (string, error) {
+	switch task.Type {
+	case "http":
+		return e.executeHTTP(task)
+	case "shell":
+		return e.executeShell(task)
+	case "function":
+		return e.executeFunction(task)
+	default:
+		return "", fmt.Errorf("unknown task type: %s", task.Type)
+	}
+}
+
+func (e *Executor) executeHTTP(task *models.Task) (string, error) {
+	config := task.Config
+	
+	method := config.Method
+	if method == "" {
+		method = "GET"
+	}
+	
+	var body io.Reader
+	if config.Body != "" {
+		body = strings.NewReader(config.Body)
+	}
+	
+	req, err := http.NewRequest(method, config.URL, body)
+	if err != nil {
+		return "", err
+	}
+	
+	// Set headers
+	for key, value := range config.Headers {
+		req.Header.Set(key, value)
+	}
+	
+	// Set timeout if specified
+	client := e.httpClient
+	if config.Timeout > 0 {
+		client = &http.Client{
+			Timeout: time.Duration(config.Timeout) * time.Second,
+		}
+	}
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	
+	result := map[string]interface{}{
+		"status_code": resp.StatusCode,
+		"headers":     resp.Header,
+		"body":        string(responseBody),
+	}
+	
+	resultJSON, _ := json.Marshal(result)
+	return string(resultJSON), nil
+}
+
+func (e *Executor) executeShell(task *models.Task) (string, error) {
+	config := task.Config
+	
+	cmd := exec.Command(config.Command, config.Args...)
+	
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	
+	// Set timeout if specified
+	if config.Timeout > 0 {
+		go func() {
+			time.Sleep(time.Duration(config.Timeout) * time.Second)
+			cmd.Process.Kill()
+		}()
+	}
+	
+	err := cmd.Run()
+	
+	result := map[string]interface{}{
+		"stdout":    stdout.String(),
+		"stderr":    stderr.String(),
+		"exit_code": cmd.ProcessState.ExitCode(),
+	}
+	
+	if err != nil {
+		result["error"] = err.Error()
+	}
+	
+	resultJSON, _ := json.Marshal(result)
+	return string(resultJSON), nil
+}
+
+func (e *Executor) executeFunction(task *models.Task) (string, error) {
+	// This would execute registered functions
+	// For now, just return a placeholder
+	config := task.Config
+	
+	result := map[string]interface{}{
+		"function": config.Function,
+		"result":   "Function executed successfully",
+		"timestamp": time.Now(),
+	}
+	
+	resultJSON, _ := json.Marshal(result)
+	return string(resultJSON), nil
+}
+
+// internal/handlers/handlers.go
+package handlers
+
+import (
+	"encoding/json"
+	"net/http"
+	"strconv"
+
+	"github.com/gin-gonic/gin"
+	"github.com/jmoiron/sqlx"
+	"taskscheduler/internal/models"
+	"taskscheduler/internal/scheduler"
+)
+
+type Handler struct {
+	db        *sqlx.DB
+	scheduler *scheduler.Scheduler
+}
+
+func New(db *sqlx.DB, sched *scheduler.Scheduler) *Handler {
+	return &Handler{
+		db:        db,
+		scheduler: sched,
+	}
+}
+
+func (h *Handler) CreateTask(c *gin.Context) {
+	var task models.Task
+	if err := c.ShouldBindJSON(&task); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	
+	configJSON, _ := json.Marshal(task.Config)
+	
+	err := h.db.QueryRow(`
+		INSERT INTO tasks (name, description, type, config, status)
+		VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at, updated_at`,
+		task.Name, task.Description, task.Type, configJSON, "active",
+	).Scan(&task.ID, &task.CreatedAt, &task.UpdatedAt)
+	
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create task"})
+		return
+	}
+	
+	c.JSON(http.StatusCreated, task)
+}
+
+func (h *Handler) ListTasks(c *gin.Context) {
+	var tasks []models.Task
+	
+	rows, err := h.db.Query("SELECT id, name, description, type, config, status, created_at, updated_at FROM tasks")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch tasks"})
+		return
+	}
+	defer rows.Close()
+	
+	for rows.Next() {
+		var task models.Task
+		var configJSON []byte
+		
+		err := rows.Scan(&task.ID, &task.Name, &task.Description, &task.Type, 
+			&configJSON, &task.Status, &task.CreatedAt, &task.UpdatedAt)
+		if err != nil {
+			continue
+		}
+		
+		json.Unmarshal(configJSON, &task.Config)
+		tasks = append(tasks, task)
+	}
+	
+	c.JSON(http.StatusOK, tasks)
+}
+
+func (h *Handler) GetTask(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid task ID"})
+		return
+	}
+	
+	var task models.Task
+	var configJSON []byte
+	
+	err = h.db.QueryRow(`
+		SELECT id, name, description, type, config, status, created_at, updated_at 
+		FROM tasks WHERE id = $1`, id).Scan(
+		&task.ID, &task.Name, &task.Description, &task.Type,
+		&configJSON, &task.Status, &task.CreatedAt, &task.UpdatedAt)
+	
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+		return
+	}
+	
+	json.Unmarshal(configJSON, &task.Config)
+	c.JSON(http.StatusOK, task)
+}
+
+func (h *Handler) UpdateTask(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid task ID"})
+		return
+	}
+	
+	var task models.Task
+	if err := c.ShouldBindJSON(&task); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	
+	task.ID = id
+	configJSON, _ := json.Marshal(task.Config)
+	
+	_, err = h.db.Exec(`
+		UPDATE tasks 
+		SET name = $1, description = $2, type = $3, config = $4, status = $5, updated_at = NOW()
+		WHERE id = $6`,
+		task.Name, task.Description, task.Type, configJSON, task.Status, id)
+	
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update task"})
+		return
+	}
+	
+	c.JSON(http.StatusOK, task)
+}
+
+func (h *Handler) DeleteTask(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid task ID"})
+		return
+	}
+	
+	_, err = h.db.Exec("DELETE FROM tasks WHERE id = $1", id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete task"})
+		return
+	}
+	
+	c.JSON(http.StatusOK, gin.H{"message": "Task deleted successfully"})
+}
+
+func (h *Handler) RunTaskNow(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid task ID"})
+		return
+	}
+	
+	if err := h.scheduler.ScheduleTaskNow(id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to schedule task"})
+		return
+	}
+	
+	c.JSON(http.StatusOK, gin.H{"message": "Task scheduled for immediate execution"})
+}
+
+func (h *Handler) CreateSchedule(c *gin.Context) {
+	var schedule models.Schedule
+	if err := c.ShouldBindJSON(&schedule); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	
+	err := h.db.QueryRow(`
+		INSERT INTO schedules (task_id, name, cron_expr, timezone, enabled)
+		VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at, updated_at`,
+		schedule.TaskID, schedule.Name, schedule.CronExpr, schedule.Timezone, schedule.Enabled,
+	).Scan(&schedule.ID, &schedule.CreatedAt, &schedule.UpdatedAt)
+	
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create schedule"})
+		return
+	}
+	
+	c.JSON(http.StatusCreated, schedule)
+}
+
+func (h *Handler) ListSchedules(c *gin.Context) {
+	var schedules []models.Schedule
+	err := h.db.Select(&schedules, "SELECT * FROM schedules ORDER BY created_at DESC")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch schedules"})
+		return
+	}
+	
+	c.JSON(http.StatusOK, schedules)
+}
+
+func (h *Handler) UpdateSchedule(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid schedule ID"})
+		return
+	}
+	
+	var schedule models.Schedule
+	if err := c.ShouldBindJSON(&schedule); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	
+	schedule.ID = id
+	_, err = h.db.Exec(`
+		UPDATE schedules 
+		SET task_id = $1, name = $2, cron_expr = $3, timezone = $4, enabled = $5, updated_at = NOW()
+		WHERE id = $6`,
+		schedule.TaskID, schedule.Name, schedule.CronExpr, schedule.Timezone, schedule.Enabled, id)
+	
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update schedule"})
+		return
+	}
+	
+	c.JSON(http.StatusOK, schedule)
+}
+
+func (h *Handler) DeleteSchedule(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid schedule ID"})
+		return
+	}
+	
+	_, err = h.db.Exec("DELETE FROM schedules WHERE id = $1", id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete schedule"})
+		return
+	}
+	
+	c.JSON(http.StatusOK, gin.H{"message": "Schedule deleted successfully"})
+}
+
+func (h *Handler) ListExecutions(c *gin.Context) {
+	var executions []models.TaskExecution
+	err := h.db.Select(&executions, "SELECT * FROM task_executions ORDER BY created_at DESC LIMIT 100")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch executions"})
+		return
+	}
+	
+	c.JSON(http.StatusOK, executions)
+}
+
+func (h *Handler) GetExecution(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid execution ID"})
+		return
+	}
+	
+	var execution models.TaskExecution
+	err = h.db.Get(&execution, "SELECT * FROM task_executions WHERE id = $1", id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Execution not found"})
+		return
+	}
+	
+	c.JSON(http.StatusOK, execution)
+}
+
+func (h *Handler) HealthCheck(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"status": "healthy",
+		"timestamp": "now",
+	})
+}
+
+func (h *Handler) GetMetrics(c *gin.Context) {
+	// Get basic metrics
+	var totalTasks, activeTasks, totalExecutions, runningExecutions int
+	
+	h.db.QueryRow("SELECT COUNT(*) FROM tasks").Scan(&totalTasks)
+	h.db.QueryRow("SELECT COUNT(*) FROM tasks WHERE status = 'active'").Scan(&activeTasks)
+	h.db.QueryRow("SELECT COUNT(*) FROM task_executions").Scan(&totalExecutions)
+	h.db.QueryRow("SELECT COUNT(*) FROM task_executions WHERE status = 'running'").Scan(&runningExecutions)
+	
+	c.JSON(http.StatusOK, gin.H{
+		"tasks": gin.H{
+			"total":  totalTasks,
+			"active": activeTasks,
+		},
+		"executions": gin.H{
+			"total":   totalExecutions,
+			"running": runningExecutions,
+		},
+	})
+}
+
+// go.mod
+module taskscheduler
+
+go 1.21
+
+require (
+	github.com/gin-gonic/gin v1.9.1
+	github.com/jmoiron/sqlx v1.3.5
+	github.com/joho/godotenv v1.4.0
+	github.com/lib/pq v1.10.9
+	github.com/robfig/cron/v3 v3.0.1
+	github.com/stretchr/testify v1.8.4
+)
+
+// Dockerfile
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o main cmd/main.go
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates tzdata
+WORKDIR /root/
+
+COPY --from=builder /app/main .
+COPY --from=builder /app/.env .
+
+EXPOSE 8080
+CMD ["./main"]
+
+// docker-compose.yml
+version: '3.8'
+
+services:
+  taskscheduler:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - DATABASE_URL=postgres://user:password@postgres:5432/taskscheduler?sslmode=disable
+      - WORKER_COUNT=5
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=taskscheduler
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
+
+// .env
+PORT=8080
+DATABASE_URL=postgres://user:password@localhost:5432/taskscheduler?sslmode=disable
+WORKER_COUNT=5
+REDIS_URL=redis://localhost:6379
+
+// tests/scheduler_test.go
+package tests
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	_ "github.com/lib/pq"
+	"taskscheduler/internal/database"
+	"taskscheduler/internal/models"
+	"taskscheduler/internal/scheduler"
+)
+
+func TestScheduler(t *testing.T) {
+	// Setup test database
+	db, err := sqlx.Connect("postgres", "postgres://user:password@localhost:5432/taskscheduler_test?sslmode=disable")
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Clean up
+	defer func() {
+		db.Exec("DROP TABLE IF EXISTS schedules, tasks, task_executions, queue")
+	}()
+
+	// Run migrations
+	err = database.runMigrations(db)
+	require.NoError(t, err)
+
+	// Create test task
+	var taskID int64
+	err = db.QueryRow(`
+		INSERT INTO tasks (name, description, type, config, status)
+		VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+		"Test Task", "Test Description", "http", 
+		`{"url": "http://httpbin.org/get", "method": "GET"}`, "active").Scan(&taskID)
+	require.NoError(t, err)
+
+	// Create scheduler
+	sched := scheduler.New(db)
+	
+	// Test scheduling task now
+	err = sched.ScheduleTaskNow(taskID)
+	assert.NoError(t, err)
+
+	// Verify execution was created
+	var count int
+	err = db.QueryRow("SELECT COUNT(*) FROM task_executions WHERE task_id = $1", taskID).Scan(&count)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, count)
+}
+
+// tests/executor_test.go
+package tests
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"taskscheduler/internal/executor"
+	"taskscheduler/internal/models"
+)
+
+func TestExecutor_HTTP(t *testing.T) {
+	exec := executor.New()
+	
+	task := &models.Task{
+		Type: "http",
+		Config: models.TaskConfig{
+			URL:    "https://httpbin.org/get",
+			Method: "GET",
+		},
+	}
+	
+	result, err := exec.Execute(task)
+	assert.NoError(t, err)
+	assert.Contains(t, result, "status_code")
+}
+
+func TestExecutor_Shell(t *testing.T) {
+	exec := executor.New()
+	
+	task := &models.Task{
+		Type: "shell",
+		Config: models.TaskConfig{
+			Command: "echo",
+			Args:    []string{"hello", "world"},
+		},
+	}
+	
+	result, err := exec.Execute(task)
+	assert.NoError(t, err)
+	assert.Contains(t, result, "hello world")
+}
+
+// .github/workflows/ci.yml
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: taskscheduler_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: 1.21
+    
+    - name: Install dependencies
+      run: go mod download
+    
+    - name: Run tests
+      env:
+        DATABASE_URL: postgres://user:password@localhost:5432/taskscheduler_test?sslmode=disable
+        REDIS_URL: redis://localhost:6379
+      run: go test -v ./...
+    
+    - name: Run tests with coverage
+      env:
+        DATABASE_URL: postgres://user:password@localhost:5432/taskscheduler_test?sslmode=disable
+        REDIS_URL: redis://localhost:6379
+      run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Build Docker image
+      run: docker build -t taskscheduler:latest .
+
+  deploy:
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Deploy to production
+      run: echo "Deploy to production environment"
+
+// README.md
+# Task Scheduler
+
+A robust task scheduling system with cron-like functionality, job queues, and worker pools.
+
+## Features
+
+- **Cron-like Scheduling**: Schedule tasks using cron expressions
+- **Multiple Task Types**: HTTP requests, shell commands, custom functions
+- **Worker Pool**: Distributed task execution with configurable workers
+- **Job Queue**: Reliable task queuing with priority support
+- **REST API**: Complete API for task and schedule management
+- **Real-time Monitoring**: Track task executions and system metrics
+- **Retry Logic**: Automatic retry with configurable delays
+- **Database Storage**: PostgreSQL for persistence
+- **Health Checks**: Built-in health monitoring
+
+## Quick Start
+
+1. Clone the repository
+2. Start services: `docker-compose up`
+3. Access API at `http://localhost:8080`
+
+### Create a Task
+
+```bash
+curl -X POST http://localhost:8080/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Health Check",
+    "description": "Check service health",
+    "type": "http",
+    "config": {
+      "url": "https://httpbin.org/get",
+      "method": "GET",
+      "timeout": 30
+    }
+  }'
+```
+
+### Schedule a Task
+
+```bash
+curl -X POST http://localhost:8080/api/v1/schedules \
+  -H "Content-Type: application/json" \
+  -d '{
+    "taskId": 1,
+    "name": "Daily Health Check",
+    "cronExpr": "0 0 9 * * *",
+    "timezone": "UTC",
+    "enabled": true
+  }'
+```
+
+## API Endpoints
+
+### Tasks
+- `POST /api/v1/tasks` - Create task
+- `GET /api/v1/tasks` - List tasks
+- `GET /api/v1/tasks/:id` - Get task
+- `PUT /api/v1/tasks/:id` - Update task
+- `DELETE /api/v1/tasks/:id` - Delete task
+- `POST /api/v1/tasks/:id/run` - Run task immediately
+
+### Schedules
+- `POST /api/v1/schedules` - Create schedule
+- `GET /api/v1/schedules` - List schedules
+- `PUT /api/v1/schedules/:id` - Update schedule
+- `DELETE /api/v1/schedules/:id` - Delete schedule
+
+### Executions
+- `GET /api/v1/executions` - List executions
+- `GET /api/v1/executions/:id` - Get execution details
+
+### System
+- `GET /api/v1/health` - Health check
+- `GET /api/v1/metrics` - System metrics
+
+## Task Types
+
+### HTTP Tasks
+Execute HTTP requests with configurable methods, headers, and timeouts.
+
+```json
+{
+  "type": "http",
+  "config": {
+    "url": "https://api.example.com/webhook",
+    "method": "POST",
+    "headers": {
+      "Authorization": "Bearer token"
+    },
+    "body": "{\"message\": \"hello\"}",
+    "timeout": 30
+  }
+}
+```
+
+### Shell Tasks
+Execute shell commands with arguments and timeout control.
+
+```json
+{
+  "type": "shell",
+  "config": {
+    "command": "/usr/bin/backup.sh",
+    "args": ["--database", "mydb"],
+    "timeout": 3600
+  }
+}
+```
+
+### Function Tasks
+Execute registered functions (custom implementation required).
+
+```json
+{
+  "type": "function",
+  "config": {
+    "function": "sendEmailReport",
+    "timeout": 300
+  }
+}
+```
+
+## Configuration
+
+Environment variables:
+
+```env
+PORT=8080
+DATABASE_URL=postgres://user:password@localhost:5432/taskscheduler?sslmode=disable
+WORKER_COUNT=5
+REDIS_URL=redis://localhost:6379
+```
+
+## Development
+
+```bash
+# Install dependencies
+go mod download
+
+# Run migrations
+go run cmd/migrate.go
+
+# Start server
+go run cmd/main.go
+
+# Run tests
+go test ./...
+```
+
+## Docker Deployment
+
+```bash
+# Build and run
+docker-compose up --build
+
+# Scale workers
+docker-compose up --scale taskscheduler=3
+```
+
+## Monitoring
+
+The system provides metrics at `/api/v1/metrics`:
+
+- Total and active tasks
+- Total and running executions
+- Worker status
+- Queue length
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Add tests for new functionality
+4. Ensure all tests pass
+5. Submit a pull request
