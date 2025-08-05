@@ -1,0 +1,144 @@
+// main.go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type ExchangeRatesResponse struct {
+	Rates map[string]float64 `json:"rates"`
+	Base  string             `json:"base"`
+	Date  string             `json:"date"`
+}
+
+type CurrencyConverter struct {
+	apiKey string
+	client *http.Client
+}
+
+func NewCurrencyConverter(apiKey string) *CurrencyConverter {
+	return &CurrencyConverter{
+		apiKey: apiKey,
+		client: &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+func main() {
+	if len(os.Args) < 4 {
+		fmt.Println("Использование: go run main.go <сумма> <из_валюты> <в_валюту>")
+		fmt.Println("Пример: go run main.go 100 USD EUR")
+		fmt.Println("Поддерживаемые валюты: USD, EUR, GBP, JPY, CAD, AUD, CHF, CNY, RUB")
+		os.Exit(1)
+	}
+
+	amount, err := strconv.ParseFloat(os.Args[1], 64)
+	if err != nil {
+		fmt.Printf("Ошибка: '%s' не является числом\n", os.Args[1])
+		os.Exit(1)
+	}
+
+	fromCurrency := strings.ToUpper(os.Args[2])
+	toCurrency := strings.ToUpper(os.Args[3])
+
+	// Для демонстрации используем бесплатный API без ключа
+	// В реальном проекте нужен API ключ от exchangerate-api.com
+	converter := NewCurrencyConverter("")
+	
+	result, err := converter.Convert(amount, fromCurrency, toCurrency)
+	if err != nil {
+		fmt.Printf("Ошибка конвертации: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("%.2f %s = %.2f %s\n", amount, fromCurrency, result, toCurrency)
+}
+
+func (c *CurrencyConverter) Convert(amount float64, from, to string) (float64, error) {
+	if from == to {
+		return amount, nil
+	}
+
+	rate, err := c.getExchangeRate(from, to)
+	if err != nil {
+		return 0, err
+	}
+
+	return amount * rate, nil
+}
+
+func (c *CurrencyConverter) getExchangeRate(from, to string) (float64, error) {
+	// Используем бесплатный API с ограничениями
+	url := fmt.Sprintf("https://api.exchangerate-api.com/v4/latest/%s", from)
+	
+	resp, err := c.client.Get(url)
+	if err != nil {
+		return 0, fmt.Errorf("ошибка запроса: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("API вернул статус: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("ошибка чтения ответа: %v", err)
+	}
+
+	var response ExchangeRatesResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return 0, fmt.Errorf("ошибка парсинга JSON: %v", err)
+	}
+
+	rate, exists := response.Rates[to]
+	if !exists {
+		return 0, fmt.Errorf("валюта %s не найдена", to)
+	}
+
+	return rate, nil
+}
+
+// Альтернативная версия с фиксированными курсами для демонстрации
+func (c *CurrencyConverter) getExchangeRateDemo(from, to string) (float64, error) {
+	// Демо курсы (в реальности нужно получать актуальные)
+	rates := map[string]map[string]float64{
+		"USD": {
+			"EUR": 0.85,
+			"GBP": 0.75,
+			"JPY": 110.0,
+			"RUB": 75.0,
+			"CAD": 1.25,
+		},
+		"EUR": {
+			"USD": 1.18,
+			"GBP": 0.88,
+			"JPY": 129.0,
+			"RUB": 88.0,
+		},
+		"RUB": {
+			"USD": 0.013,
+			"EUR": 0.011,
+			"GBP": 0.010,
+		},
+	}
+
+	if fromRates, exists := rates[from]; exists {
+		if rate, exists := fromRates[to]; exists {
+			return rate, nil
+		}
+	}
+
+	return 0, fmt.Errorf("курс для пары %s/%s не найден", from, to)
+}
+
+// Пример использования:
+// go run main.go 100 USD EUR
+// go run main.go 50 EUR RUB
+// go run main.go 1000 RUB USD
