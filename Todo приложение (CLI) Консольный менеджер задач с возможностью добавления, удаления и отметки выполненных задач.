@@ -1,0 +1,250 @@
+// main.go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type Task struct {
+	ID          int       `json:"id"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	Completed   bool      `json:"completed"`
+	CreatedAt   time.Time `json:"created_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+}
+
+type TodoList struct {
+	tasks    []Task
+	filename string
+	nextID   int
+}
+
+func NewTodoList(filename string) *TodoList {
+	todo := &TodoList{
+		filename: filename,
+		tasks:    []Task{},
+		nextID:   1,
+	}
+	todo.load()
+	return todo
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		printUsage()
+		os.Exit(1)
+	}
+
+	todo := NewTodoList("tasks.json")
+	command := os.Args[1]
+
+	switch command {
+	case "add":
+		if len(os.Args) < 3 {
+			fmt.Println("Использование: todo add <заголовок> [описание]")
+			os.Exit(1)
+		}
+		title := os.Args[2]
+		description := ""
+		if len(os.Args) > 3 {
+			description = strings.Join(os.Args[3:], " ")
+		}
+		todo.addTask(title, description)
+	case "list":
+		todo.listTasks()
+	case "complete":
+		if len(os.Args) < 3 {
+			fmt.Println("Использование: todo complete <id>")
+			os.Exit(1)
+		}
+		id, err := strconv.Atoi(os.Args[2])
+		if err != nil {
+			fmt.Printf("Неверный ID: %s\n", os.Args[2])
+			os.Exit(1)
+		}
+		todo.completeTask(id)
+	case "delete":
+		if len(os.Args) < 3 {
+			fmt.Println("Использование: todo delete <id>")
+			os.Exit(1)
+		}
+		id, err := strconv.Atoi(os.Args[2])
+		if err != nil {
+			fmt.Printf("Неверный ID: %s\n", os.Args[2])
+			os.Exit(1)
+		}
+		todo.deleteTask(id)
+	case "clear":
+		todo.clearCompleted()
+	default:
+		printUsage()
+		os.Exit(1)
+	}
+}
+
+func printUsage() {
+	fmt.Println("Todo - простой менеджер задач")
+	fmt.Println("\nИспользование:")
+	fmt.Println("  todo add <заголовок> [описание]  - Добавить новую задачу")
+	fmt.Println("  todo list                       - Показать все задачи")
+	fmt.Println("  todo complete <id>              - Отметить задачу как выполненную")
+	fmt.Println("  todo delete <id>                - Удалить задачу")
+	fmt.Println("  todo clear                      - Удалить все выполненные задачи")
+}
+
+func (t *TodoList) addTask(title, description string) {
+	task := Task{
+		ID:          t.nextID,
+		Title:       title,
+		Description: description,
+		Completed:   false,
+		CreatedAt:   time.Now(),
+	}
+	
+	t.tasks = append(t.tasks, task)
+	t.nextID++
+	t.save()
+	
+	fmt.Printf("Задача добавлена: #%d %s\n", task.ID, task.Title)
+}
+
+func (t *TodoList) listTasks() {
+	if len(t.tasks) == 0 {
+		fmt.Println("Нет задач")
+		return
+	}
+
+	fmt.Println("Список задач:")
+	fmt.Println(strings.Repeat("-", 50))
+	
+	for _, task := range t.tasks {
+		status := "[ ]"
+		if task.Completed {
+			status = "[✓]"
+		}
+		
+		fmt.Printf("%s #%d %s\n", status, task.ID, task.Title)
+		if task.Description != "" {
+			fmt.Printf("     %s\n", task.Description)
+		}
+		
+		fmt.Printf("     Создана: %s\n", task.CreatedAt.Format("2006-01-02 15:04"))
+		if task.Completed && task.CompletedAt != nil {
+			fmt.Printf("     Выполнена: %s\n", task.CompletedAt.Format("2006-01-02 15:04"))
+		}
+		fmt.Println()
+	}
+	
+	completed := 0
+	for _, task := range t.tasks {
+		if task.Completed {
+			completed++
+		}
+	}
+	
+	fmt.Printf("Всего задач: %d, выполнено: %d, осталось: %d\n", 
+		len(t.tasks), completed, len(t.tasks)-completed)
+}
+
+func (t *TodoList) completeTask(id int) {
+	for i, task := range t.tasks {
+		if task.ID == id {
+			if task.Completed {
+				fmt.Printf("Задача #%d уже выполнена\n", id)
+				return
+			}
+			
+			now := time.Now()
+			t.tasks[i].Completed = true
+			t.tasks[i].CompletedAt = &now
+			t.save()
+			
+			fmt.Printf("Задача #%d отмечена как выполненная\n", id)
+			return
+		}
+	}
+	
+	fmt.Printf("Задача с ID %d не найдена\n", id)
+}
+
+func (t *TodoList) deleteTask(id int) {
+	for i, task := range t.tasks {
+		if task.ID == id {
+			t.tasks = append(t.tasks[:i], t.tasks[i+1:]...)
+			t.save()
+			fmt.Printf("Задача #%d удалена\n", id)
+			return
+		}
+	}
+	
+	fmt.Printf("Задача с ID %d не найдена\n", id)
+}
+
+func (t *TodoList) clearCompleted() {
+	var remaining []Task
+	deleted := 0
+	
+	for _, task := range t.tasks {
+		if !task.Completed {
+			remaining = append(remaining, task)
+		} else {
+			deleted++
+		}
+	}
+	
+	t.tasks = remaining
+	t.save()
+	
+	fmt.Printf("Удалено %d выполненных задач\n", deleted)
+}
+
+func (t *TodoList) save() {
+	data, err := json.MarshalIndent(t.tasks, "", "  ")
+	if err != nil {
+		fmt.Printf("Ошибка сохранения: %v\n", err)
+		return
+	}
+	
+	err = ioutil.WriteFile(t.filename, data, 0644)
+	if err != nil {
+		fmt.Printf("Ошибка записи файла: %v\n", err)
+	}
+}
+
+func (t *TodoList) load() {
+	data, err := ioutil.ReadFile(t.filename)
+	if err != nil {
+		// Файл не существует, это нормально для первого запуска
+		return
+	}
+	
+	err = json.Unmarshal(data, &t.tasks)
+	if err != nil {
+		fmt.Printf("Ошибка загрузки файла: %v\n", err)
+		return
+	}
+	
+	// Найти следующий ID
+	maxID := 0
+	for _, task := range t.tasks {
+		if task.ID > maxID {
+			maxID = task.ID
+		}
+	}
+	t.nextID = maxID + 1
+}
+
+// Пример использования:
+// go run main.go add "Купить продукты" "Молоко, хлеб, яйца"
+// go run main.go add "Сделать домашнее задание"
+// go run main.go list
+// go run main.go complete 1
+// go run main.go delete 2
+// go run main.go clear
