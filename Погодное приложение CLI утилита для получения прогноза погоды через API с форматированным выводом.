@@ -1,0 +1,237 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+type WeatherResponse struct {
+	Location struct {
+		Name    string `json:"name"`
+		Country string `json:"country"`
+		Region  string `json:"region"`
+	} `json:"location"`
+	Current struct {
+		TempC       float64 `json:"temp_c"`
+		TempF       float64 `json:"temp_f"`
+		Condition   struct {
+			Text string `json:"text"`
+			Icon string `json:"icon"`
+		} `json:"condition"`
+		Humidity    int     `json:"humidity"`
+		WindKph     float64 `json:"wind_kph"`
+		WindDir     string  `json:"wind_dir"`
+		Pressure    float64 `json:"pressure_mb"`
+		FeelsLikeC  float64 `json:"feelslike_c"`
+		UV          float64 `json:"uv"`
+		Visibility  float64 `json:"vis_km"`
+	} `json:"current"`
+	Forecast struct {
+		Forecastday []struct {
+			Date string `json:"date"`
+			Day  struct {
+				MaxTempC  float64 `json:"maxtemp_c"`
+				MinTempC  float64 `json:"mintemp_c"`
+				Condition struct {
+					Text string `json:"text"`
+				} `json:"condition"`
+				ChanceOfRain int `json:"daily_chance_of_rain"`
+			} `json:"day"`
+		} `json:"forecastday"`
+	} `json:"forecast"`
+}
+
+type WeatherApp struct {
+	apiKey string
+	client *http.Client
+}
+
+func NewWeatherApp(apiKey string) *WeatherApp {
+	return &WeatherApp{
+		apiKey: apiKey,
+		client: &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		showUsage()
+		os.Exit(1)
+	}
+
+	// API ключ можно получить на weatherapi.com бесплатно
+	apiKey := os.Getenv("WEATHER_API_KEY")
+	if apiKey == "" {
+		// Демо режим без API ключа
+		fmt.Println("⚠️  API ключ не найден, используется демо режим")
+		handleDemoMode(os.Args[1])
+		return
+	}
+
+	location := strings.Join(os.Args[1:], " ")
+	app := NewWeatherApp(apiKey)
+
+	// Определяем команду
+	switch os.Args[1] {
+	case "current", "now":
+		if len(os.Args) < 3 {
+			fmt.Println("❌ Укажите город")
+			fmt.Println("Пример: weather current Moscow")
+			os.Exit(1)
+		}
+		location = strings.Join(os.Args[2:], " ")
+		app.getCurrentWeather(location)
+	case "forecast":
+		if len(os.Args) < 3 {
+			fmt.Println("❌ Укажите город")
+			fmt.Println("Пример: weather forecast London")
+			os.Exit(1)
+		}
+		location = strings.Join(os.Args[2:], " ")
+		app.getForecast(location)
+	default:
+		// Если первый аргумент не команда, считаем его городом
+		app.getCurrentWeather(location)
+	}
+}
+
+func showUsage() {
+	fmt.Println("🌤️  Погодное приложение")
+	fmt.Println("Использование: go run main.go <команда> <город>")
+	fmt.Println("\nКоманды:")
+	fmt.Println("  current, now <город>    - Текущая погода")
+	fmt.Println("  forecast <город>        - Прогноз на 3 дня")
+	fmt.Println("  <город>                 - Текущая погода (краткая форма)")
+	fmt.Println("\nПримеры:")
+	fmt.Println("  go run main.go current Moscow")
+	fmt.Println("  go run main.go forecast \"New York\"")
+	fmt.Println("  go run main.go London")
+	fmt.Println("\n⚙️  Установите переменную окружения WEATHER_API_KEY")
+	fmt.Println("   (получите бесплатный ключ на https://weatherapi.com)")
+	fmt.Println("   export WEATHER_API_KEY=your_api_key_here")
+}
+
+func (wa *WeatherApp) getCurrentWeather(location string) {
+	fmt.Printf("🌤️  Получение текущей погоды для: %s\n", location)
+	
+	url := fmt.Sprintf("http://api.weatherapi.com/v1/current.json?key=%s&q=%s&aqi=no", 
+		wa.apiKey, location)
+
+	weather, err := wa.makeRequest(url)
+	if err != nil {
+		fmt.Printf("❌ Ошибка получения данных: %v\n", err)
+		return
+	}
+
+	wa.displayCurrentWeather(weather)
+}
+
+func (wa *WeatherApp) getForecast(location string) {
+	fmt.Printf("📅 Получение прогноза погоды для: %s\n", location)
+	
+	url := fmt.Sprintf("http://api.weatherapi.com/v1/forecast.json?key=%s&q=%s&days=3&aqi=no", 
+		wa.apiKey, location)
+
+	weather, err := wa.makeRequest(url)
+	if err != nil {
+		fmt.Printf("❌ Ошибка получения данных: %v\n", err)
+		return
+	}
+
+	wa.displayCurrentWeather(weather)
+	wa.displayForecast(weather)
+}
+
+func (wa *WeatherApp) makeRequest(url string) (*WeatherResponse, error) {
+	resp, err := wa.client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("сетевая ошибка: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 400 {
+		return nil, fmt.Errorf("город не найден")
+	}
+	if resp.StatusCode == 401 {
+		return nil, fmt.Errorf("неверный API ключ")
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("API вернул код: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка чтения ответа: %v", err)
+	}
+
+	var weather WeatherResponse
+	if err := json.Unmarshal(body, &weather); err != nil {
+		return nil, fmt.Errorf("ошибка парсинга JSON: %v", err)
+	}
+
+	return &weather, nil
+}
+
+func (wa *WeatherApp) displayCurrentWeather(weather *WeatherResponse) {
+	fmt.Printf("\n%s\n", strings.Repeat("=", 60))
+	fmt.Printf("🏙️  Текущая погода в %s, %s\n", 
+		weather.Location.Name, weather.Location.Country)
+	if weather.Location.Region != "" {
+		fmt.Printf("📍 Регион: %s\n", weather.Location.Region)
+	}
+	fmt.Printf("%s\n", strings.Repeat("-", 60))
+
+	// Определяем иконку по описанию погоды
+	weatherIcon := getWeatherIcon(weather.Current.Condition.Text)
+	
+	fmt.Printf("%s %s\n", weatherIcon, weather.Current.Condition.Text)
+	fmt.Printf("🌡️  Температура: %.1f°C (ощущается как %.1f°C)\n", 
+		weather.Current.TempC, weather.Current.FeelsLikeC)
+	fmt.Printf("💧 Влажность: %d%%\n", weather.Current.Humidity)
+	fmt.Printf("💨 Ветер: %.1f км/ч %s\n", 
+		weather.Current.WindKph, weather.Current.WindDir)
+	fmt.Printf("📊 Давление: %.0f мб\n", weather.Current.Pressure)
+	fmt.Printf("👁️  Видимость: %.1f км\n", weather.Current.Visibility)
+	fmt.Printf("☀️  УФ-индекс: %.1f\n", weather.Current.UV)
+	
+	fmt.Printf("%s\n", strings.Repeat("=", 60))
+}
+
+func (wa *WeatherApp) displayForecast(weather *WeatherResponse) {
+	if len(weather.Forecast.Forecastday) == 0 {
+		return
+	}
+
+	fmt.Printf("\n📅 Прогноз на 3 дня:\n")
+	fmt.Printf("%s\n", strings.Repeat("-", 60))
+
+	for i, day := range weather.Forecast.Forecastday {
+		date, _ := time.Parse("2006-01-02", day.Date)
+		dayName := getDayName(i)
+		
+		weatherIcon := getWeatherIcon(day.Day.Condition.Text)
+		
+		fmt.Printf("%s %s (%s)\n", 
+			dayName, date.Format("02.01.2006"), weatherIcon)
+		fmt.Printf("   %s\n", day.Day.Condition.Text)
+		fmt.Printf("   🌡️  %.1f°C ... %.1f°C\n", 
+			day.Day.MinTempC, day.Day.MaxTempC)
+		if day.Day.ChanceOfRain > 0 {
+			fmt.Printf("   🌧️  Вероятность дождя: %d%%\n", 
+				day.Day.ChanceOfRain)
+		}
+		fmt.Println()
+	}
+}
+
+func getDayName(index int) string {
+	switch index {
+	case 0:
+		return "🕐 Сегодня   "
+	case 1:
+		return "📅 Завтра   "
