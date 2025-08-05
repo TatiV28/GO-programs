@@ -1,0 +1,1226 @@
+// cmd/main.go
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
+	"cachesystem/internal/cache"
+	"cachesystem/internal/config"
+	"cachesystem/internal/handlers"
+	"cachesystem/internal/persistence"
+	"cachesystem/internal/replication"
+)
+
+func main() {
+	// Load environment variables
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found")
+	}
+
+	cfg := config.Load()
+
+	// Initialize persistence layer
+	var persister persistence.Persister
+	var err error
+	
+	switch cfg.Persistence.Type {
+	case "disk":
+		persister, err = persistence.NewDiskPersister(cfg.Persistence.Path)
+	case "redis":
+		persister, err = persistence.NewRedisPersister(cfg.Persistence.RedisURL)
+	default:
+		persister = persistence.NewNullPersister()
+	}
+	
+	if err != nil {
+		log.Fatal("Failed to initialize persistence:", err)
+	}
+
+	// Initialize cache
+	cacheInstance := cache.New(cfg.Cache, persister)
+
+	// Initialize replication (if enabled)
+	var replicator *replication.Replicator
+	if cfg.Cluster.Enabled {
+		replicator = replication.New(cfg.Cluster, cacheInstance)
+		go replicator.Start()
+	}
+
+	// Load persisted data
+	if err := cacheInstance.LoadFromPersistence(); err != nil {
+		log.Printf("Warning: Failed to load persisted data: %v", err)
+	}
+
+	// Setup periodic persistence
+	if cfg.Persistence.Enabled {
+		go func() {
+			ticker := time.NewTicker(time.Duration(cfg.Persistence.Interval) * time.Second)
+			defer ticker.Stop()
+			
+			for range ticker.C {
+				if err := cacheInstance.SaveToPersistence(); err != nil {
+					log.Printf("Error saving to persistence: %v", err)
+				}
+			}
+		}()
+	}
+
+	// Setup eviction worker
+	go cacheInstance.StartEvictionWorker()
+
+	// Setup HTTP server
+	router := gin.Default()
+	
+	// Middleware
+	router.Use(gin.Recovery())
+	router.Use(middleware.Logger())
+	router.Use(middleware.CORS())
+
+	// Initialize handlers
+	h := handlers.New(cacheInstance, replicator)
+
+	// API routes
+	v1 := router.Group("/api/v1")
+	{
+		// Cache operations
+		v1.GET("/cache/:key", h.Get)
+		v1.POST("/cache/:key", h.Set)
+		v1.PUT("/cache/:key", h.Set)
+		v1.DELETE("/cache/:key", h.Delete)
+		v1.POST("/cache/:key/expire", h
+v1.POST("/cache/:key/expire", h.SetExpire)
+		v1.POST("/cache/:key/ttl", h.GetTTL)
+		
+		// Batch operations
+		v1.POST("/cache/mget", h.MultiGet)
+		v1.POST("/cache/mset", h.MultiSet)
+		v1.POST("/cache/mdel", h.MultiDelete)
+		
+		// Cache management
+		v1.POST("/cache/flush", h.FlushAll)
+		v1.GET("/cache/keys", h.GetKeys)
+		v1.GET("/cache/stats", h.GetStats)
+		v1.GET("/cache/info", h.GetInfo)
+		
+		// Health and monitoring
+		v1.GET("/health", h.HealthCheck)
+		v1.GET("/metrics", h.GetMetrics)
+	}
+
+	server := &http.Server{
+		Addr:    ":" + cfg.Server.Port,
+		Handler: router,
+	}
+
+	// Start server
+	go func() {
+		log.Printf("Cache server starting on port %s", cfg.Server.Port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal("Server failed to start:", err)
+		}
+	}()
+
+	// Graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down server...")
+
+	// Save cache to persistence before shutdown
+	if cfg.Persistence.Enabled {
+		log.Println("Saving cache to persistence...")
+		if err := cacheInstance.SaveToPersistence(); err != nil {
+			log.Printf("Error saving cache: %v", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatal("Server forced to shutdown:", err)
+	}
+
+	log.Println("Server exited")
+}
+
+// internal/config/config.go
+package config
+
+import (
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type Config struct {
+	Server      ServerConfig      `json:"server"`
+	Cache       CacheConfig       `json:"cache"`
+	Persistence PersistenceConfig `json:"persistence"`
+	Cluster     ClusterConfig     `json:"cluster"`
+}
+
+type ServerConfig struct {
+	Port         string `json:"port"`
+	ReadTimeout  int    `json:"readTimeout"`
+	WriteTimeout int    `json:"writeTimeout"`
+}
+
+type CacheConfig struct {
+	MaxSize         int64         `json:"maxSize"`         // Maximum cache size in bytes
+	MaxKeys         int           `json:"maxKeys"`         // Maximum number of keys
+	DefaultTTL      time.Duration `json:"defaultTTL"`      // Default TTL for keys
+	EvictionPolicy  string        `json:"evictionPolicy"`  // LRU, LFU, FIFO, TTL
+	CleanupInterval time.Duration `json:"cleanupInterval"` // Cleanup interval for expired keys
+}
+
+type PersistenceConfig struct {
+	Enabled  bool   `json:"enabled"`
+	Type     string `json:"type"`     // "disk", "redis", "none"
+	Path     string `json:"path"`     // For disk persistence
+	RedisURL string `json:"redisURL"` // For Redis persistence
+	Interval int    `json:"interval"` // Persistence interval in seconds
+}
+
+type ClusterConfig struct {
+	Enabled         bool     `json:"enabled"`
+	NodeID          string   `json:"nodeId"`
+	ListenAddr      string   `json:"listenAddr"`
+	Peers           []string `json:"peers"`
+	ReplicationPort string   `json:"replicationPort"`
+}
+
+func Load() *Config {
+	maxSize, _ := strconv.ParseInt(getEnv("CACHE_MAX_SIZE", "1073741824"), 10, 64) // 1GB
+	maxKeys, _ := strconv.Atoi(getEnv("CACHE_MAX_KEYS", "1000000"))                // 1M keys
+	defaultTTL, _ := strconv.Atoi(getEnv("CACHE_DEFAULT_TTL", "3600"))             // 1 hour
+	cleanupInterval, _ := strconv.Atoi(getEnv("CACHE_CLEANUP_INTERVAL", "300"))    // 5 minutes
+	persistenceInterval, _ := strconv.Atoi(getEnv("PERSISTENCE_INTERVAL", "300"))  // 5 minutes
+
+	return &Config{
+		Server: ServerConfig{
+			Port:         getEnv("PORT", "8080"),
+			ReadTimeout:  30,
+			WriteTimeout: 30,
+		},
+		Cache: CacheConfig{
+			MaxSize:         maxSize,
+			MaxKeys:         maxKeys,
+			DefaultTTL:      time.Duration(defaultTTL) * time.Second,
+			EvictionPolicy:  getEnv("EVICTION_POLICY", "LRU"),
+			CleanupInterval: time.Duration(cleanupInterval) * time.Second,
+		},
+		Persistence: PersistenceConfig{
+			Enabled:  getEnv("PERSISTENCE_ENABLED", "true") == "true",
+			Type:     getEnv("PERSISTENCE_TYPE", "disk"),
+			Path:     getEnv("PERSISTENCE_PATH", "./cache.db"),
+			RedisURL: getEnv("REDIS_URL", "redis://localhost:6379"),
+			Interval: persistenceInterval,
+		},
+		Cluster: ClusterConfig{
+			Enabled:         getEnv("CLUSTER_ENABLED", "false") == "true",
+			NodeID:          getEnv("NODE_ID", "node1"),
+			ListenAddr:      getEnv("CLUSTER_LISTEN_ADDR", "0.0.0.0:9090"),
+			Peers:           strings.Split(getEnv("CLUSTER_PEERS", ""), ","),
+			ReplicationPort: getEnv("REPLICATION_PORT", "9090"),
+		},
+	}
+}
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// internal/models/models.go
+package models
+
+import (
+	"encoding/json"
+	"time"
+)
+
+type CacheItem struct {
+	Key       string      `json:"key"`
+	Value     interface{} `json:"value"`
+	ExpiresAt *time.Time  `json:"expiresAt,omitempty"`
+	CreatedAt time.Time   `json:"createdAt"`
+	UpdatedAt time.Time   `json:"updatedAt"`
+	AccessAt  time.Time   `json:"accessAt"`
+	Size      int64       `json:"size"`
+	Hits      int64       `json:"hits"`
+}
+
+type CacheStats struct {
+	Keys           int     `json:"keys"`
+	Size           int64   `json:"size"`
+	MaxSize        int64   `json:"maxSize"`
+	Hits           int64   `json:"hits"`
+	Misses         int64   `json:"misses"`
+	HitRate        float64 `json:"hitRate"`
+	Evictions      int64   `json:"evictions"`
+	ExpiredKeys    int64   `json:"expiredKeys"`
+	MemoryUsage    float64 `json:"memoryUsage"`
+	UptimeSeconds  int64   `json:"uptimeSeconds"`
+}
+
+type BatchRequest struct {
+	Keys []string `json:"keys"`
+}
+
+type BatchSetRequest struct {
+	Items []BatchSetItem `json:"items"`
+}
+
+type BatchSetItem struct {
+	Key   string      `json:"key"`
+	Value interface{} `json:"value"`
+	TTL   *int        `json:"ttl,omitempty"` // TTL in seconds
+}
+
+type SetRequest struct {
+	Value interface{} `json:"value"`
+	TTL   *int        `json:"ttl,omitempty"` // TTL in seconds
+}
+
+type ExpireRequest struct {
+	TTL int `json:"ttl"` // TTL in seconds
+}
+
+// internal/cache/cache.go
+package cache
+
+import (
+	"encoding/json"
+	"fmt"
+	"sync"
+	"time"
+
+	"cachesystem/internal/config"
+	"cachesystem/internal/eviction"
+	"cachesystem/internal/models"
+	"cachesystem/internal/persistence"
+)
+
+type Cache struct {
+	config     config.CacheConfig
+	items      map[string]*models.CacheItem
+	mutex      sync.RWMutex
+	stats      models.CacheStats
+	persister  persistence.Persister
+	evictor    eviction.Evictor
+	startTime  time.Time
+}
+
+func New(config config.CacheConfig, persister persistence.Persister) *Cache {
+	var evictor eviction.Evictor
+	
+	switch config.EvictionPolicy {
+	case "LFU":
+		evictor = eviction.NewLFU()
+	case "FIFO":
+		evictor = eviction.NewFIFO()
+	case "TTL":
+		evictor = eviction.NewTTL()
+	default:
+		evictor = eviction.NewLRU()
+	}
+
+	return &Cache{
+		config:    config,
+		items:     make(map[string]*models.CacheItem),
+		persister: persister,
+		evictor:   evictor,
+		startTime: time.Now(),
+		stats: models.CacheStats{
+			MaxSize: config.MaxSize,
+		},
+	}
+}
+
+func (c *Cache) Get(key string) (interface{}, bool) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	item, exists := c.items[key]
+	if !exists {
+		c.stats.Misses++
+		return nil, false
+	}
+
+	// Check if expired
+	if item.ExpiresAt != nil && time.Now().After(*item.ExpiresAt) {
+		delete(c.items, key)
+		c.evictor.Remove(key)
+		c.stats.Misses++
+		c.stats.ExpiredKeys++
+		return nil, false
+	}
+
+	// Update access time and hits
+	item.AccessAt = time.Now()
+	item.Hits++
+	c.stats.Hits++
+
+	// Update eviction policy
+	c.evictor.Access(key, item.Hits, item.AccessAt)
+
+	return item.Value, true
+}
+
+func (c *Cache) Set(key string, value interface{}, ttl *time.Duration) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	now := time.Now()
+	
+	// Calculate expiration
+	var expiresAt *time.Time
+	if ttl != nil {
+		exp := now.Add(*ttl)
+		expiresAt = &exp
+	} else if c.config.DefaultTTL > 0 {
+		exp := now.Add(c.config.DefaultTTL)
+		expiresAt = &exp
+	}
+
+	// Calculate size
+	valueBytes, _ := json.Marshal(value)
+	size := int64(len(key) + len(valueBytes))
+
+	// Check if we need to evict
+	if err := c.evictIfNeeded(size); err != nil {
+		return err
+	}
+
+	// Update or create item
+	if existingItem, exists := c.items[key]; exists {
+		c.stats.Size -= existingItem.Size
+		existingItem.Value = value
+		existingItem.ExpiresAt = expiresAt
+		existingItem.UpdatedAt = now
+		existingItem.Size = size
+		c.stats.Size += size
+	} else {
+		item := &models.CacheItem{
+			Key:       key,
+			Value:     value,
+			ExpiresAt: expiresAt,
+			CreatedAt: now,
+			UpdatedAt: now,
+			AccessAt:  now,
+			Size:      size,
+			Hits:      0,
+		}
+		c.items[key] = item
+		c.stats.Keys++
+		c.stats.Size += size
+	}
+
+	// Update eviction policy
+	c.evictor.Add(key, 0, now)
+
+	return nil
+}
+
+func (c *Cache) Delete(key string) bool {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	item, exists := c.items[key]
+	if !exists {
+		return false
+	}
+
+	delete(c.items, key)
+	c.evictor.Remove(key)
+	c.stats.Keys--
+	c.stats.Size -= item.Size
+
+	return true
+}
+
+func (c *Cache) SetExpire(key string, ttl time.Duration) bool {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	item, exists := c.items[key]
+	if !exists {
+		return false
+	}
+
+	expiresAt := time.Now().Add(ttl)
+	item.ExpiresAt = &expiresAt
+	item.UpdatedAt = time.Now()
+
+	return true
+}
+
+func (c *Cache) GetTTL(key string) (time.Duration, bool) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	item, exists := c.items[key]
+	if !exists {
+		return 0, false
+	}
+
+	if item.ExpiresAt == nil {
+		return -1, true // No expiration
+	}
+
+	ttl := time.Until(*item.ExpiresAt)
+	if ttl < 0 {
+		return 0, true // Already expired
+	}
+
+	return ttl, true
+}
+
+func (c *Cache) MultiGet(keys []string) map[string]interface{} {
+	result := make(map[string]interface{})
+	
+	for _, key := range keys {
+		if value, exists := c.Get(key); exists {
+			result[key] = value
+		}
+	}
+	
+	return result
+}
+
+func (c *Cache) MultiSet(items []models.BatchSetItem) error {
+	for _, item := range items {
+		var ttl *time.Duration
+		if item.TTL != nil {
+			duration := time.Duration(*item.TTL) * time.Second
+			ttl = &duration
+		}
+		
+		if err := c.Set(item.Key, item.Value, ttl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Cache) MultiDelete(keys []string) int {
+	count := 0
+	for _, key := range keys {
+		if c.Delete(key) {
+			count++
+		}
+	}
+	return count
+}
+
+func (c *Cache) FlushAll() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	c.items = make(map[string]*models.CacheItem)
+	c.evictor.Clear()
+	c.stats.Keys = 0
+	c.stats.Size = 0
+}
+
+func (c *Cache) GetKeys(pattern string) []string {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	keys := make([]string, 0, len(c.items))
+	for key := range c.items {
+		// Simple pattern matching (could be enhanced with regex)
+		if pattern == "" || pattern == "*" {
+			keys = append(keys, key)
+		}
+		// Add more pattern matching logic here if needed
+	}
+
+	return keys
+}
+
+func (c *Cache) GetStats() models.CacheStats {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	stats := c.stats
+	stats.UptimeSeconds = int64(time.Since(c.startTime).Seconds())
+	
+	if stats.Hits+stats.Misses > 0 {
+		stats.HitRate = float64(stats.Hits) / float64(stats.Hits+stats.Misses)
+	}
+	
+	if stats.MaxSize > 0 {
+		stats.MemoryUsage = float64(stats.Size) / float64(stats.MaxSize)
+	}
+
+	return stats
+}
+
+func (c *Cache) evictIfNeeded(newItemSize int64) error {
+	// Check size limit
+	if c.config.MaxSize > 0 && c.stats.Size+newItemSize > c.config.MaxSize {
+		return c.evictBySize(newItemSize)
+	}
+	
+	// Check key limit
+	if c.config.MaxKeys > 0 && c.stats.Keys >= c.config.MaxKeys {
+		return c.evictByCount(1)
+	}
+	
+	return nil
+}
+
+func (c *Cache) evictBySize(requiredSpace int64) error {
+	freedSpace := int64(0)
+	
+	for freedSpace < requiredSpace {
+		key := c.evictor.Evict()
+		if key == "" {
+			return fmt.Errorf("unable to free enough space")
+		}
+		
+		if item, exists := c.items[key]; exists {
+			freedSpace += item.Size
+			delete(c.items, key)
+			c.stats.Keys--
+			c.stats.Size -= item.Size
+			c.stats.Evictions++
+		}
+	}
+	
+	return nil
+}
+
+func (c *Cache) evictByCount(count int) error {
+	for i := 0; i < count; i++ {
+		key := c.evictor.Evict()
+		if key == "" {
+			return fmt.Errorf("unable to evict enough items")
+		}
+		
+		if item, exists := c.items[key]; exists {
+			delete(c.items, key)
+			c.stats.Keys--
+			c.stats.Size -= item.Size
+			c.stats.Evictions++
+		}
+	}
+	
+	return nil
+}
+
+func (c *Cache) StartEvictionWorker() {
+	ticker := time.NewTicker(c.config.CleanupInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		c.cleanupExpired()
+	}
+}
+
+func (c *Cache) cleanupExpired() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	now := time.Now()
+	expiredKeys := make([]string, 0)
+
+	for key, item := range c.items {
+		if item.ExpiresAt != nil && now.After(*item.ExpiresAt) {
+			expiredKeys = append(expiredKeys, key)
+		}
+	}
+
+	for _, key := range expiredKeys {
+		if item, exists := c.items[key]; exists {
+			delete(c.items, key)
+			c.evictor.Remove(key)
+			c.stats.Keys--
+			c.stats.Size -= item.Size
+			c.stats.ExpiredKeys++
+		}
+	}
+}
+
+func (c *Cache) SaveToPersistence() error {
+	if c.persister == nil {
+		return nil
+	}
+
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	return c.persister.Save(c.items)
+}
+
+func (c *Cache) LoadFromPersistence() error {
+	if c.persister == nil {
+		return nil
+	}
+
+	items, err := c.persister.Load()
+	if err != nil {
+		return err
+	}
+
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	now := time.Now()
+	validItems := make(map[string]*models.CacheItem)
+	totalSize := int64(0)
+
+	// Filter out expired items
+	for key, item := range items {
+		if item.ExpiresAt == nil || now.Before(*item.ExpiresAt) {
+			validItems[key] = item
+			totalSize += item.Size
+			c.evictor.Add(key, item.Hits, item.AccessAt)
+		}
+	}
+
+	c.items = validItems
+	c.stats.Keys = len(validItems)
+	c.stats.Size = totalSize
+
+	return nil
+}
+
+// internal/eviction/lru.go
+package eviction
+
+import (
+	"container/list"
+	"sync"
+	"time"
+)
+
+type LRU struct {
+	capacity int
+	items    map[string]*list.Element
+	order    *list.List
+	mutex    sync.RWMutex
+}
+
+type lruItem struct {
+	key      string
+	accessed time.Time
+}
+
+func NewLRU() *LRU {
+	return &LRU{
+		items: make(map[string]*list.Element),
+		order: list.New(),
+	}
+}
+
+func (lru *LRU) Add(key string, frequency int64, accessTime time.Time) {
+	lru.mutex.Lock()
+	defer lru.mutex.Unlock()
+
+	if elem, exists := lru.items[key]; exists {
+		lru.order.MoveToFront(elem)
+		elem.Value.(*lruItem).accessed = accessTime
+	} else {
+		item := &lruItem{key: key, accessed: accessTime}
+		elem := lru.order.PushFront(item)
+		lru.items[key] = elem
+	}
+}
+
+func (lru *LRU) Access(key string, frequency int64, accessTime time.Time) {
+	lru.Add(key, frequency, accessTime)
+}
+
+func (lru *LRU) Remove(key string) {
+	lru.mutex.Lock()
+	defer lru.mutex.Unlock()
+
+	if elem, exists := lru.items[key]; exists {
+		lru.order.Remove(elem)
+		delete(lru.items, key)
+	}
+}
+
+func (lru *LRU) Evict() string {
+	lru.mutex.Lock()
+	defer lru.mutex.Unlock()
+
+	if lru.order.Len() == 0 {
+		return ""
+	}
+
+	elem := lru.order.Back()
+	if elem != nil {
+		lru.order.Remove(elem)
+		item := elem.Value.(*lruItem)
+		delete(lru.items, item.key)
+		return item.key
+	}
+
+	return ""
+}
+
+func (lru *LRU) Clear() {
+	lru.mutex.Lock()
+	defer lru.mutex.Unlock()
+
+	lru.items = make(map[string]*list.Element)
+	lru.order = list.New()
+}
+
+// internal/eviction/lfu.go
+package eviction
+
+import (
+	"sync"
+	"time"
+)
+
+type LFU struct {
+	frequencies map[string]int64
+	mutex       sync.RWMutex
+}
+
+func NewLFU() *LFU {
+	return &LFU{
+		frequencies: make(map[string]int64),
+	}
+}
+
+func (lfu *LFU) Add(key string, frequency int64, accessTime time.Time) {
+	lfu.mutex.Lock()
+	defer lfu.mutex.Unlock()
+	lfu.frequencies[key] = frequency
+}
+
+func (lfu *LFU) Access(key string, frequency int64, accessTime time.Time) {
+	lfu.mutex.Lock()
+	defer lfu.mutex.Unlock()
+	lfu.frequencies[key] = frequency
+}
+
+func (lfu *LFU) Remove(key string) {
+	lfu.mutex.Lock()
+	defer lfu.mutex.Unlock()
+	delete(lfu.frequencies, key)
+}
+
+func (lfu *LFU) Evict() string {
+	lfu.mutex.Lock()
+	defer lfu.mutex.Unlock()
+
+	if len(lfu.frequencies) == 0 {
+		return ""
+	}
+
+	var minKey string
+	var minFreq int64 = -1
+
+	for key, freq := range lfu.frequencies {
+		if minFreq == -1 || freq < minFreq {
+			minFreq = freq
+			minKey = key
+		}
+	}
+
+	if minKey != "" {
+		delete(lfu.frequencies, minKey)
+	}
+
+	return minKey
+}
+
+func (lfu *LFU) Clear() {
+	lfu.mutex.Lock()
+	defer lfu.mutex.Unlock()
+	lfu.frequencies = make(map[string]int64)
+}
+
+// internal/eviction/fifo.go
+package eviction
+
+import (
+	"sync"
+	"time"
+)
+
+type FIFO struct {
+	order []string
+	mutex sync.RWMutex
+}
+
+func NewFIFO() *FIFO {
+	return &FIFO{
+		order: make([]string, 0),
+	}
+}
+
+func (fifo *FIFO) Add(key string, frequency int64, accessTime time.Time) {
+	fifo.mutex.Lock()
+	defer fifo.mutex.Unlock()
+
+	// Check if key already exists
+	for _, existingKey := range fifo.order {
+		if existingKey == key {
+			return // Already exists, don't add again
+		}
+	}
+
+	fifo.order = append(fifo.order, key)
+}
+
+func (fifo *FIFO) Access(key string, frequency int64, accessTime time.Time) {
+	// FIFO doesn't change order on access
+}
+
+func (fifo *FIFO) Remove(key string) {
+	fifo.mutex.Lock()
+	defer fifo.mutex.Unlock()
+
+	for i, existingKey := range fifo.order {
+		if existingKey == key {
+			fifo.order = append(fifo.order[:i], fifo.order[i+1:]...)
+			break
+		}
+	}
+}
+
+func (fifo *FIFO) Evict() string {
+	fifo.mutex.Lock()
+	defer fifo.mutex.Unlock()
+
+	if len(fifo.order) == 0 {
+		return ""
+	}
+
+	key := fifo.order[0]
+	fifo.order = fifo.order[1:]
+	return key
+}
+
+func (fifo *FIFO) Clear() {
+	fifo.mutex.Lock()
+	defer fifo.mutex.Unlock()
+	fifo.order = make([]string, 0)
+}
+
+// internal/eviction/ttl.go
+package eviction
+
+import (
+	"sync"
+	"time"
+)
+
+type TTL struct {
+	accessTimes map[string]time.Time
+	mutex       sync.RWMutex
+}
+
+func NewTTL() *TTL {
+	return &TTL{
+		accessTimes: make(map[string]time.Time),
+	}
+}
+
+func (ttl *TTL) Add(key string, frequency int64, accessTime time.Time) {
+	ttl.mutex.Lock()
+	defer ttl.mutex.Unlock()
+	ttl.accessTimes[key] = accessTime
+}
+
+func (ttl *TTL) Access(key string, frequency int64, accessTime time.Time) {
+	ttl.mutex.Lock()
+	defer ttl.mutex.Unlock()
+	ttl.accessTimes[key] = accessTime
+}
+
+func (ttl *TTL) Remove(key string) {
+	ttl.mutex.Lock()
+	defer ttl.mutex.Unlock()
+	delete(ttl.accessTimes, key)
+}
+
+func (ttl *TTL) Evict() string {
+	ttl.mutex.Lock()
+	defer ttl.mutex.Unlock()
+
+	if len(ttl.accessTimes) == 0 {
+		return ""
+	}
+
+	var oldestKey string
+	var oldestTime time.Time
+
+	for key, accessTime := range ttl.accessTimes {
+		if oldestKey == "" || accessTime.Before(oldestTime) {
+			oldestKey = key
+			oldestTime = accessTime
+		}
+	}
+
+	if oldestKey != "" {
+		delete(ttl.accessTimes, oldestKey)
+	}
+
+	return oldestKey
+}
+
+func (ttl *TTL) Clear() {
+	ttl.mutex.Lock()
+	defer ttl.mutex.Unlock()
+	ttl.accessTimes = make(map[string]time.Time)
+}
+
+// internal/eviction/evictor.go
+package eviction
+
+import "time"
+
+type Evictor interface {
+	Add(key string, frequency int64, accessTime time.Time)
+	Access(key string, frequency int64, accessTime time.Time)
+	Remove(key string)
+	Evict() string
+	Clear()
+}
+
+// internal/persistence/disk.go
+package persistence
+
+import (
+	"encoding/json"
+	"os"
+
+	"cachesystem/internal/models"
+)
+
+type DiskPersister struct {
+	filePath string
+}
+
+func NewDiskPersister(filePath string) (*DiskPersister, error) {
+	return &DiskPersister{filePath: filePath}, nil
+}
+
+func (dp *DiskPersister) Save(items map[string]*models.CacheItem) error {
+	data, err := json.Marshal(items)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(dp.filePath, data, 0644)
+}
+
+func (dp *DiskPersister) Load() (map[string]*models.CacheItem, error) {
+	data, err := os.ReadFile(dp.filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return make(map[string]*models.CacheItem), nil
+		}
+		return nil, err
+	}
+
+	var items map[string]*models.CacheItem
+	err = json.Unmarshal(data, &items)
+	if err != nil {
+		return nil, err
+	}
+
+	return items, nil
+}
+
+// internal/persistence/redis.go
+package persistence
+
+import (
+	"encoding/json"
+	"context"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+	"cachesystem/internal/models"
+)
+
+type RedisPersister struct {
+	client *redis.Client
+	key    string
+}
+
+func NewRedisPersister(redisURL string) (*RedisPersister, error) {
+	opt, err := redis.ParseURL(redisURL)
+	if err != nil {
+		return nil, err
+	}
+
+	client := redis.NewClient(opt)
+	
+	// Test connection
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	if err := client.Ping(ctx).Err(); err != nil {
+		return nil, err
+	}
+
+	return &RedisPersister{
+		client: client,
+		key:    "cache:persistence",
+	}, nil
+}
+
+func (rp *RedisPersister) Save(items map[string]*models.CacheItem) error {
+	ctx := context.Background()
+	
+	data, err := json.Marshal(items)
+	if err != nil {
+		return err
+	}
+
+	return rp.client.Set(ctx, rp.key, data, 0).Err()
+}
+
+func (rp *RedisPersister) Load() (map[string]*models.CacheItem, error) {
+	ctx := context.Background()
+	
+	data, err := rp.client.Get(ctx, rp.key).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return make(map[string]*models.CacheItem), nil
+		}
+		return nil, err
+	}
+
+	var items map[string]*models.CacheItem
+	err = json.Unmarshal([]byte(data), &items)
+	if err != nil {
+		return nil, err
+	}
+
+	return items, nil
+}
+
+// internal/persistence/null.go
+package persistence
+
+import "cachesystem/internal/models"
+
+type NullPersister struct{}
+
+func NewNullPersister() *NullPersister {
+	return &NullPersister{}
+}
+
+func (np *N// cmd/main.go
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
+	"cachesystem/internal/cache"
+	"cachesystem/internal/config"
+	"cachesystem/internal/handlers"
+	"cachesystem/internal/persistence"
+	"cachesystem/internal/replication"
+)
+
+func main() {
+	// Load environment variables
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found")
+	}
+
+	cfg := config.Load()
+
+	// Initialize persistence layer
+	var persister persistence.Persister
+	var err error
+	
+	switch cfg.Persistence.Type {
+	case "disk":
+		persister, err = persistence.NewDiskPersister(cfg.Persistence.Path)
+	case "redis":
+		persister, err = persistence.NewRedisPersister(cfg.Persistence.RedisURL)
+	default:
+		persister = persistence.NewNullPersister()
+	}
+	
+	if err != nil {
+		log.Fatal("Failed to initialize persistence:", err)
+	}
+
+	// Initialize cache
+	cacheInstance := cache.New(cfg.Cache, persister)
+
+	// Initialize replication (if enabled)
+	var replicator *replication.Replicator
+	if cfg.Cluster.Enabled {
+		replicator = replication.New(cfg.Cluster, cacheInstance)
+		go replicator.Start()
+	}
+
+	// Load persisted data
+	if err := cacheInstance.LoadFromPersistence(); err != nil {
+		log.Printf("Warning: Failed to load persisted data: %v", err)
+	}
+
+	// Setup periodic persistence
+	if cfg.Persistence.Enabled {
+		go func() {
+			ticker := time.NewTicker(time.Duration(cfg.Persistence.Interval) * time.Second)
+			defer ticker.Stop()
+			
+			for range ticker.C {
+				if err := cacheInstance.SaveToPersistence(); err != nil {
+					log.Printf("Error saving to persistence: %v", err)
+				}
+			}
+		}()
+	}
+
+	// Setup eviction worker
+	go cacheInstance.StartEvictionWorker()
+
+	// Setup HTTP server
+	router := gin.Default()
+	
+	// Middleware
+	router.Use(gin.Recovery())
+	router.Use(middleware.Logger())
+	router.Use(middleware.CORS())
+
+	// Initialize handlers
+	h := handlers.New(cacheInstance, replicator)
+
+	// API routes
+	v1 := router.Group("/api/v1")
+	{
+		// Cache operations
+		v1.GET("/cache/:key", h.Get)
+		v1.POST("/cache/:key", h.Set)
+		v1.PUT("/cache/:key", h.Set)
+		v1.DELETE("/cache/:key", h.Delete)
+		v1.POST("/cache/:key/expire", h
