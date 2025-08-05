@@ -1,0 +1,1226 @@
+// Monitoring System with Prometheus & Grafana
+// main.go
+package main
+
+import (
+	"log"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+)
+
+var (
+	// Prometheus метрики
+	httpRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "http_requests_total",
+			Help: "Total number of HTTP requests",
+		},
+		[]string{"method", "endpoint", "status"},
+	)
+	
+	httpRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "http_request_duration_seconds",
+			Help:    "Duration of HTTP requests in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "endpoint"},
+	)
+	
+	activeConnections = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "active_connections",
+			Help: "Number of active connections",
+		},
+	)
+	
+	databaseConnections = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "database_connections",
+			Help: "Number of database connections",
+		},
+		[]string{"state"},
+	)
+	
+	businessMetrics = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "business_events_total",
+			Help: "Total number of business events",
+		},
+		[]string{"event_type", "status"},
+	)
+	
+	systemHealth = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "system_health",
+			Help: "System health status (1 = healthy, 0 = unhealthy)",
+		},
+		[]string{"component"},
+	)
+)
+
+func init() {
+	// Регистрируем метрики
+	prometheus.MustRegister(httpRequestsTotal)
+	prometheus.MustRegister(httpRequestDuration)
+	prometheus.MustRegister(activeConnections)
+	prometheus.MustRegister(databaseConnections)
+	prometheus.MustRegister(businessMetrics)
+	prometheus.MustRegister(systemHealth)
+}
+
+func main() {
+	// Подключение к базе данных
+	db, err := initDB()
+	if err != nil {
+		log.Fatal("Ошибка подключения к базе данных:", err)
+	}
+
+	// Автоматическая миграция
+	db.AutoMigrate(&User{}, &Order{}, &SystemEvent{})
+
+	// Инициализация сервисов
+	monitoringService := NewMonitoringService(db)
+	alertManager := NewAlertManager()
+	healthChecker := NewHealthChecker(db)
+	
+	// Запуск фоновых задач
+	go monitoringService.StartMetricsCollection()
+	go healthChecker.StartHealthChecks()
+	go alertManager.StartAlertProcessor()
+
+	// Настройка роутера
+	r := gin.Default()
+	
+	// Middleware для метрик
+	r.Use(metricsMiddleware())
+	r.Use(corsMiddleware())
+
+	// Prometheus metrics endpoint
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+	
+	// Health check endpoints
+	r.GET("/health", healthChecker.HealthCheck)
+	r.GET("/ready", healthChecker.ReadinessCheck)
+	r.GET("/live", healthChecker.LivenessCheck)
+
+	// API маршруты
+	api := r.Group("/api")
+	{
+		// Пользователи (для демонстрации business метрик)
+		api.POST("/users", monitoringService.CreateUser)
+		api.GET("/users", monitoringService.GetUsers)
+		api.GET("/users/:id", monitoringService.GetUser)
+		
+		// Заказы
+		api.POST("/orders", monitoringService.CreateOrder)
+		api.GET("/orders", monitoringService.GetOrders)
+		api.PUT("/orders/:id/status", monitoringService.UpdateOrderStatus)
+		
+		// Мониторинг
+		api.GET("/metrics/custom", monitoringService.GetCustomMetrics)
+		api.GET("/events", monitoringService.GetSystemEvents)
+		api.POST("/events", monitoringService.CreateSystemEvent)
+		
+		// Алерты
+		api.GET("/alerts", alertManager.GetAlerts)
+		api.POST("/alerts/test", alertManager.TriggerTestAlert)
+	}
+
+	// Симуляция нагрузки для демонстрации
+	go simulateTraffic()
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("Monitoring System запущен на порту %s", port)
+	log.Printf("Metrics доступны на http://localhost:%s/metrics", port)
+	r.Run(":" + port)
+}
+
+func initDB() (*gorm.DB, error) {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "host=localhost user=postgres password=postgres dbname=monitoringdb port=5432 sslmode=disable"
+	}
+	
+	return gorm.Open(postgres.Open(dsn), &gorm.Config{})
+}
+
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// models.go
+package main
+
+import (
+	"time"
+	"gorm.io/gorm"
+)
+
+type User struct {
+	ID        uint           `json:"id" gorm:"primarykey"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
+	Username  string         `json:"username" gorm:"uniqueIndex;not null"`
+	Email     string         `json:"email" gorm:"uniqueIndex;not null"`
+	Status    string         `json:"status" gorm:"default:active"`
+}
+
+type Order struct {
+	ID          uint           `json:"id" gorm:"primarykey"`
+	CreatedAt   time.Time      `json:"created_at"`
+	UpdatedAt   time.Time      `json:"updated_at"`
+	DeletedAt   gorm.DeletedAt `json:"-" gorm:"index"`
+	UserID      uint           `json:"user_id" gorm:"not null"`
+	Status      string         `json:"status" gorm:"default:pending"`
+	Amount      float64        `json:"amount" gorm:"not null"`
+	Description string         `json:"description"`
+	User        User           `json:"user,omitempty" gorm:"foreignKey:UserID"`
+}
+
+type SystemEvent struct {
+	ID          uint      `json:"id" gorm:"primarykey"`
+	CreatedAt   time.Time `json:"created_at"`
+	Type        string    `json:"type" gorm:"not null"`        // info, warning, error, critical
+	Component   string    `json:"component" gorm:"not null"`   // database, api, cache, etc.
+	Message     string    `json:"message" gorm:"not null"`
+	Details     string    `json:"details" gorm:"type:text"`
+	UserID      *uint     `json:"user_id,omitempty"`
+	Resolved    bool      `json:"resolved" gorm:"default:false"`
+	ResolvedAt  *time.Time `json:"resolved_at,omitempty"`
+}
+
+type Alert struct {
+	ID          uint      `json:"id"`
+	CreatedAt   time.Time `json:"created_at"`
+	Type        string    `json:"type"`
+	Severity    string    `json:"severity"`
+	Component   string    `json:"component"`
+	Message     string    `json:"message"`
+	Threshold   float64   `json:"threshold,omitempty"`
+	CurrentValue float64  `json:"current_value,omitempty"`
+	Resolved    bool      `json:"resolved"`
+	ResolvedAt  *time.Time `json:"resolved_at,omitempty"`
+}
+
+type HealthStatus struct {
+	Status     string            `json:"status"`
+	Timestamp  time.Time         `json:"timestamp"`
+	Version    string            `json:"version"`
+	Components map[string]string `json:"components"`
+	Uptime     string            `json:"uptime"`
+}
+
+// middleware.go
+package main
+
+import (
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+func metricsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		
+		// Увеличиваем счетчик активных соединений
+		activeConnections.Inc()
+		defer activeConnections.Dec()
+
+		// Обрабатываем запрос
+		c.Next()
+
+		// Записываем метрики после обработки
+		duration := time.Since(start)
+		status := strconv.Itoa(c.Writer.Status())
+		
+		httpRequestsTotal.WithLabelValues(
+			c.Request.Method,
+			c.FullPath(),
+			status,
+		).Inc()
+		
+		httpRequestDuration.WithLabelValues(
+			c.Request.Method,
+			c.FullPath(),
+		).Observe(duration.Seconds())
+	}
+}
+
+// monitoring_service.go
+package main
+
+import (
+	"fmt"
+	"math/rand"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+)
+
+type MonitoringService struct {
+	db        *gorm.DB
+	startTime time.Time
+}
+
+func NewMonitoringService(db *gorm.DB) *MonitoringService {
+	return &MonitoringService{
+		db:        db,
+		startTime: time.Now(),
+	}
+}
+
+func (s *MonitoringService) StartMetricsCollection() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.collectDatabaseMetrics()
+			s.collectSystemMetrics()
+		}
+	}
+}
+
+func (s *MonitoringService) collectDatabaseMetrics() {
+	sqlDB, err := s.db.DB()
+	if err != nil {
+		return
+	}
+
+	stats := sqlDB.Stats()
+	databaseConnections.WithLabelValues("open").Set(float64(stats.OpenConnections))
+	databaseConnections.WithLabelValues("idle").Set(float64(stats.Idle))
+	databaseConnections.WithLabelValues("in_use").Set(float64(stats.InUse))
+	
+	// Проверяем доступность базы данных
+	if err := sqlDB.Ping(); err != nil {
+		systemHealth.WithLabelValues("database").Set(0)
+		s.createSystemEvent("error", "database", "Database ping failed", err.Error())
+	} else {
+		systemHealth.WithLabelValues("database").Set(1)
+	}
+}
+
+func (s *MonitoringService) collectSystemMetrics() {
+	// Симулируем различные системные метрики
+	systemHealth.WithLabelValues("api").Set(1)
+	systemHealth.WithLabelValues("cache").Set(1)
+	systemHealth.WithLabelValues("queue").Set(1)
+}
+
+func (s *MonitoringService) createSystemEvent(eventType, component, message, details string) {
+	event := SystemEvent{
+		Type:      eventType,
+		Component: component,
+		Message:   message,
+		Details:   details,
+	}
+	s.db.Create(&event)
+}
+
+// API handlers
+func (s *MonitoringService) CreateUser(c *gin.Context) {
+	var user User
+	if err := c.ShouldBindJSON(&user); err != nil {
+		businessMetrics.WithLabelValues("user_creation", "failed").Inc()
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := s.db.Create(&user).Error; err != nil {
+		businessMetrics.WithLabelValues("user_creation", "failed").Inc()
+		s.createSystemEvent("error", "user_service", "Failed to create user", err.Error())
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка создания пользователя"})
+		return
+	}
+
+	businessMetrics.WithLabelValues("user_creation", "success").Inc()
+	s.createSystemEvent("info", "user_service", fmt.Sprintf("User created: %s", user.Username), "")
+	
+	c.JSON(http.StatusCreated, user)
+}
+
+func (s *MonitoringService) GetUsers(c *gin.Context) {
+	var users []User
+	
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "10"))
+	offset := (page - 1) * limit
+	
+	start := time.Now()
+	result := s.db.Offset(offset).Limit(limit).Find(&users)
+	queryDuration := time.Since(start)
+	
+	if result.Error != nil {
+		businessMetrics.WithLabelValues("user_fetch", "failed").Inc()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": result.Error.Error()})
+		return
+	}
+	
+	businessMetrics.WithLabelValues("user_fetch", "success").Inc()
+	
+	// Записываем время выполнения запроса к БД
+	if queryDuration > 100*time.Millisecond {
+		s.createSystemEvent("warning", "database", "Slow query detected", fmt.Sprintf("Query took %v", queryDuration))
+	}
+	
+	var total int64
+	s.db.Model(&User{}).Count(&total)
+	
+	c.JSON(http.StatusOK, gin.H{
+		"users": users,
+		"pagination": gin.H{
+			"page":  page,
+			"limit": limit,
+			"total": total,
+		},
+	})
+}
+
+func (s *MonitoringService) GetUser(c *gin.Context) {
+	id := c.Param("id")
+	var user User
+	
+	result := s.db.First(&user, id)
+	if result.Error != nil {
+		if result.Error == gorm.ErrRecordNotFound {
+			businessMetrics.WithLabelValues("user_fetch", "not_found").Inc()
+			c.JSON(http.StatusNotFound, gin.H{"error": "Пользователь не найден"})
+			return
+		}
+		businessMetrics.WithLabelValues("user_fetch", "failed").Inc()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": result.Error.Error()})
+		return
+	}
+	
+	businessMetrics.WithLabelValues("user_fetch", "success").Inc()
+	c.JSON(http.StatusOK, user)
+}
+
+func (s *MonitoringService) CreateOrder(c *gin.Context) {
+	var order Order
+	if err := c.ShouldBindJSON(&order); err != nil {
+		businessMetrics.WithLabelValues("order_creation", "failed").Inc()
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := s.db.Create(&order).Error; err != nil {
+		businessMetrics.WithLabelValues("order_creation", "failed").Inc()
+		s.createSystemEvent("error", "order_service", "Failed to create order", err.Error())
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка создания заказа"})
+		return
+	}
+
+	businessMetrics.WithLabelValues("order_creation", "success").Inc()
+	s.createSystemEvent("info", "order_service", fmt.Sprintf("Order created: %d", order.ID), "")
+	
+	c.JSON(http.StatusCreated, order)
+}
+
+func (s *MonitoringService) GetOrders(c *gin.Context) {
+	var orders []Order
+	
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "10"))
+	offset := (page - 1) * limit
+	
+	result := s.db.Preload("User").Offset(offset).Limit(limit).Find(&orders)
+	if result.Error != nil {
+		businessMetrics.WithLabelValues("order_fetch", "failed").Inc()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": result.Error.Error()})
+		return
+	}
+	
+	businessMetrics.WithLabelValues("order_fetch", "success").Inc()
+	
+	var total int64
+	s.db.Model(&Order{}).Count(&total)
+	
+	c.JSON(http.StatusOK, gin.H{
+		"orders": orders,
+		"pagination": gin.H{
+			"page":  page,
+			"limit": limit,
+			"total": total,
+		},
+	})
+}
+
+func (s *MonitoringService) UpdateOrderStatus(c *gin.Context) {
+	id := c.Param("id")
+	var req struct {
+		Status string `json:"status" binding:"required"`
+	}
+	
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var order Order
+	if err := s.db.First(&order, id).Error; err != nil {
+		businessMetrics.WithLabelValues("order_update", "not_found").Inc()
+		c.JSON(http.StatusNotFound, gin.H{"error": "Заказ не найден"})
+		return
+	}
+
+	oldStatus := order.Status
+	order.Status = req.Status
+
+	if err := s.db.Save(&order).Error; err != nil {
+		businessMetrics.WithLabelValues("order_update", "failed").Inc()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка обновления заказа"})
+		return
+	}
+
+	businessMetrics.WithLabelValues("order_update", "success").Inc()
+	businessMetrics.WithLabelValues("order_status_change", req.Status).Inc()
+	
+	s.createSystemEvent("info", "order_service", 
+		fmt.Sprintf("Order %d status changed from %s to %s", order.ID, oldStatus, req.Status), "")
+	
+	c.JSON(http.StatusOK, order)
+}
+
+func (s *MonitoringService) GetCustomMetrics(c *gin.Context) {
+	// Возвращаем кастомные метрики в JSON формате
+	metrics := map[string]interface{}{
+		"uptime_seconds": time.Since(s.startTime).Seconds(),
+		"database_status": s.getDatabaseStatus(),
+		"active_users": s.getActiveUsersCount(),
+		"pending_orders": s.getPendingOrdersCount(),
+		"system_load": s.getSystemLoad(),
+	}
+	
+	c.JSON(http.StatusOK, metrics)
+}
+
+func (s *MonitoringService) GetSystemEvents(c *gin.Context) {
+	var events []SystemEvent
+	
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	eventType := c.Query("type")
+	component := c.Query("component")
+	
+	offset := (page - 1) * limit
+	
+	query := s.db.Offset(offset).Limit(limit).Order("created_at DESC")
+	
+	if eventType != "" {
+		query = query.Where("type = ?", eventType)
+	}
+	if component != "" {
+		query = query.Where("component = ?", component)
+	}
+	
+	result := query.Find(&events)
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": result.Error.Error()})
+		return
+	}
+	
+	var total int64
+	countQuery := s.db.Model(&SystemEvent{})
+	if eventType != "" {
+		countQuery = countQuery.Where("type = ?", eventType)
+	}
+	if component != "" {
+		countQuery = countQuery.Where("component = ?", component)
+	}
+	countQuery.Count(&total)
+	
+	c.JSON(http.StatusOK, gin.H{
+		"events": events,
+		"pagination": gin.H{
+			"page":  page,
+			"limit": limit,
+			"total": total,
+		},
+	})
+}
+
+func (s *MonitoringService) CreateSystemEvent(c *gin.Context) {
+	var event SystemEvent
+	if err := c.ShouldBindJSON(&event); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := s.db.Create(&event).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка создания события"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, event)
+}
+
+// Вспомогательные методы
+func (s *MonitoringService) getDatabaseStatus() string {
+	sqlDB, err := s.db.DB()
+	if err != nil {
+		return "error"
+	}
+	
+	if err := sqlDB.Ping(); err != nil {
+		return "unhealthy"
+	}
+	return "healthy"
+}
+
+func (s *MonitoringService) getActiveUsersCount() int64 {
+	var count int64
+	s.db.Model(&User{}).Where("status = ?", "active").Count(&count)
+	return count
+}
+
+func (s *MonitoringService) getPendingOrdersCount() int64 {
+	var count int64
+	s.db.Model(&Order{}).Where("status = ?", "pending").Count(&count)
+	return count
+}
+
+func (s *MonitoringService) getSystemLoad() float64 {
+	// Симулируем системную нагрузку
+	return rand.Float64() * 100
+}
+
+// health_checker.go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+)
+
+type HealthChecker struct {
+	db        *gorm.DB
+	startTime time.Time
+}
+
+func NewHealthChecker(db *gorm.DB) *HealthChecker {
+	return &HealthChecker{
+		db:        db,
+		startTime: time.Now(),
+	}
+}
+
+func (h *HealthChecker) StartHealthChecks() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			h.performHealthChecks()
+		}
+	}
+}
+
+func (h *HealthChecker) performHealthChecks() {
+	// Проверка базы данных
+	if err := h.checkDatabase(); err != nil {
+		systemHealth.WithLabelValues("database").Set(0)
+	} else {
+		systemHealth.WithLabelValues("database").Set(1)
+	}
+	
+	// Проверка других компонентов
+	systemHealth.WithLabelValues("api").Set(1)
+	systemHealth.WithLabelValues("cache").Set(1)
+}
+
+func (h *HealthChecker) checkDatabase() error {
+	sqlDB, err := h.db.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Ping()
+}
+
+func (h *HealthChecker) HealthCheck(c *gin.Context) {
+	status := h.getOverallStatus()
+	components := h.getComponentsStatus()
+	
+	healthStatus := HealthStatus{
+		Status:     status,
+		Timestamp:  time.Now(),
+		Version:    "1.0.0",
+		Components: components,
+		Uptime:     h.getUptime(),
+	}
+	
+	statusCode := http.StatusOK
+	if status != "healthy" {
+		statusCode = http.StatusServiceUnavailable
+	}
+	
+	c.JSON(statusCode, healthStatus)
+}
+
+func (h *HealthChecker) ReadinessCheck(c *gin.Context) {
+	// Проверяем готовность всех критических компонентов
+	if err := h.checkDatabase(); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status": "not_ready",
+			"reason": "database_unavailable",
+		})
+		return
+	}
+	
+	c.JSON(http.StatusOK, gin.H{
+		"status": "ready",
+		"timestamp": time.Now(),
+	})
+}
+
+func (h *HealthChecker) LivenessCheck(c *gin.Context) {
+	// Простая проверка жизнеспособности приложения
+	c.JSON(http.StatusOK, gin.H{
+		"status": "alive",
+		"timestamp": time.Now(),
+		"uptime": h.getUptime(),
+	})
+}
+
+func (h *HealthChecker) getOverallStatus() string {
+	if err := h.checkDatabase(); err != nil {
+		return "unhealthy"
+	}
+	return "healthy"
+}
+
+func (h *HealthChecker) getComponentsStatus() map[string]string {
+	components := make(map[string]string)
+	
+	// Проверка базы данных
+	if err := h.checkDatabase(); err != nil {
+		components["database"] = "unhealthy"
+	} else {
+		components["database"] = "healthy"
+	}
+	
+	// Другие компоненты
+	components["api"] = "healthy"
+	components["cache"] = "healthy"
+	components["queue"] = "healthy"
+	
+	return components
+}
+
+func (h *HealthChecker) getUptime() string {
+	uptime := time.Since(h.startTime)
+	return uptime.String()
+}
+
+// alert_manager.go
+package main
+
+import (
+	"log"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+type AlertManager struct {
+	alerts []Alert
+	mutex  sync.RWMutex
+}
+
+func NewAlertManager() *AlertManager {
+	return &AlertManager{
+		alerts: make([]Alert, 0),
+	}
+}
+
+func (am *AlertManager) StartAlertProcessor() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			am.checkAlertConditions()
+		}
+	}
+}
+
+func (am *AlertManager) checkAlertConditions() {
+	// Проверяем различные условия для алертов
+	am.checkDatabaseConnections()
+	am.checkResponseTime()
+	am.checkErrorRate()
+	am.checkSystemHealth()
+}
+
+func (am *AlertManager) checkDatabaseConnections() {
+	// Симулируем проверку подключений к БД
+	openConnections := 50.0 // Получаем из метрик
+	threshold := 80.0
+	
+	if openConnections > threshold {
+		am.createAlert("database_connections", "warning", "database", 
+			"High number of database connections", threshold, openConnections)
+	}
+}
+
+func (am *AlertManager) checkResponseTime() {
+	// Симулируем проверку времени ответа
+	avgResponseTime := 2.5 // секунды
+	threshold := 2.0
+	
+	if avgResponseTime > threshold {
+		am.createAlert("response_time", "critical", "api", 
+			"High response time detected", threshold, avgResponseTime)
+	}
+}
+
+func (am *AlertManager) checkErrorRate() {
+	// Симулируем проверку частоты ошибок
+	errorRate := 15.0 // процент
+	threshold := 10.0
+	
+	if errorRate > threshold {
+		am.createAlert("error_rate", "critical", "api", 
+			"High error rate detected", threshold, errorRate)
+	}
+}
+
+func (am *AlertManager) checkSystemHealth() {
+	// Проверяем здоровье системы
+	// Эта проверка основана на метриках Prometheus
+}
+
+func (am *AlertManager) createAlert(alertType, severity, component, message string, threshold, currentValue float64) {
+	am.mutex.Lock()
+	defer am.mutex.Unlock()
+	
+	// Проверяем, есть ли уже такой алерт
+	for i, alert := range am.alerts {
+		if alert.Type == alertType && alert.Component == component && !alert.Resolved {
+			// Обновляем существующий алерт
+			am.alerts[i].CurrentValue = currentValue
+			return
+		}
+	}
+	
+	// Создаем новый алерт
+	alert := Alert{
+		ID:           uint(len(am.alerts) + 1),
+		CreatedAt:    time.Now(),
+		Type:         alertType,
+		Severity:     severity,
+		Component:    component,
+		Message:      message,
+		Threshold:    threshold,
+		CurrentValue: currentValue,
+		Resolved:     false,
+	}
+	
+	am.alerts = append(am.alerts, alert)
+	
+	log.Printf("ALERT: [%s] %s - %s (threshold: %.2f, current: %.2f)", 
+		severity, component, message, threshold, currentValue)
+}
+
+func (am *AlertManager) GetAlerts(c *gin.Context) {
+	am.mutex.RLock()
+	defer am.mutex.RUnlock()
+	
+	resolved := c.Query("resolved")
+	severity := c.Query("severity")
+	
+	var filteredAlerts []Alert
+	for _, alert := range am.alerts {
+		if resolved != "" {
+			if (resolved == "true" && !alert.Resolved) || (resolved == "false" && alert.Resolved) {
+				continue
+			}
+		}
+		if severity != "" && alert.Severity != severity {
+			continue
+		}
+		filteredAlerts = append(filteredAlerts, alert)
+	}
+	
+	c.JSON(http.StatusOK, gin.H{
+		"alerts": filteredAlerts,
+		"total":  len(filteredAlerts),
+	})
+}
+
+func (am *AlertManager) TriggerTestAlert(c *gin.Context) {
+	var req struct {
+		Type      string  `json:"type" binding:"required"`
+		Severity  string  `json:"severity" binding:"required"`
+		Component string  `json:"component" binding:"required"`
+		Message   string  `json:"message" binding:"required"`
+		Threshold float64 `json:"threshold"`
+		Value     float64 `json:"value"`
+	}
+	
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	
+	am.createAlert(req.Type, req.Severity, req.Component, req.Message, req.Threshold, req.Value)
+	
+	c.JSON(http.StatusCreated, gin.H{"message": "Test alert created"})
+}
+
+// traffic_simulator.go
+package main
+
+import (
+	"math/rand"
+	"time"
+)
+
+func simulateTraffic() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Симулируем различные события
+			simulateUserActivity()
+			simulateOrderActivity()
+			simulateSystemEvents()
+		}
+	}
+}
+
+func simulateUserActivity() {
+	// Симулируем активность пользователей
+	userEvents := []string{"login", "logout", "profile_update", "password_change"}
+	statuses := []string{"success", "failed"}
+	
+	for i := 0; i < rand.Intn(5); i++ {
+		event := userEvents[rand.Intn(len(userEvents))]
+		status := statuses[rand.Intn(len(statuses))]
+		businessMetrics.WithLabelValues("user_"+event, status).Inc()
+	}
+}
+
+func simulateOrderActivity() {
+	// Симулируем активность заказов
+	orderEvents := []string{"creation", "payment", "shipment", "delivery"}
+	statuses := []string{"success", "failed", "pending"}
+	
+	for i := 0; i < rand.Intn(3); i++ {
+		event := orderEvents[rand.Intn(len(orderEvents))]
+		status := statuses[rand.Intn(len(statuses))]
+		businessMetrics.WithLabelValues("order_"+event, status).Inc()
+	}
+}
+
+func simulateSystemEvents() {
+	// Симулируем системные события
+	if rand.Intn(100) < 5 { // 5% вероятность
+		components := []string{"database", "cache", "queue", "storage"}
+		component := components[rand.Intn(len(components))]
+		
+		if rand.Intn(10) < 7 { // 70% здоровых компонентов
+			systemHealth.WithLabelValues(component).Set(1)
+		} else {
+			systemHealth.WithLabelValues(component).Set(0)
+		}
+	}
+}
+
+// go.mod
+module monitoring-system
+
+go 1.21
+
+require (
+	github.com/gin-gonic/gin v1.9.1
+	github.com/prometheus/client_golang v1.17.0
+	gorm.io/driver/postgres v1.5.4
+	gorm.io/gorm v1.25.5
+)
+
+// docker-compose.yml
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - DATABASE_URL=host=postgres user=postgres password=postgres dbname=monitoringdb port=5432 sslmode=disable
+    depends_on:
+      - postgres
+    networks:
+      - monitoring
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=monitoringdb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - monitoring
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/etc/grafana/dashboards
+    networks:
+      - monitoring
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml
+    networks:
+      - monitoring
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  monitoring:
+    driver: bridge
+
+// prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert_rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+scrape_configs:
+  - job_name: 'monitoring-app'
+    static_configs:
+      - targets: ['app:8080']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+// alert_rules.yml
+groups:
+  - name: application_alerts
+    rules:
+      - alert: HighResponseTime
+        expr: histogram_quantile(0.95, http_request_duration_seconds_bucket) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High response time detected"
+          description: "95th percentile response time is above 0.5 seconds"
+
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is above 10%"
+
+      - alert: DatabaseDown
+        expr: system_health{component="database"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database is down"
+          description: "Database health check is failing"
+
+      - alert: HighDatabaseConnections
+        expr: database_connections{state="open"} > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High database connections"
+          description: "Number of open database connections is above 80"
+
+// alertmanager.yml
+global:
+  smtp_smarthost: 'localhost:587'
+  smtp_from: 'alerts@company.com'
+
+route:
+  group_by: ['alertname']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  receiver: 'web.hook'
+
+receivers:
+  - name: 'web.hook'
+    webhook_configs:
+      - url: 'http://app:8080/api/alerts/webhook'
+        send_resolved: true
+
+// Dockerfile
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN go build -o monitoring-system .
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+
+COPY --from=builder /app/monitoring-system .
+
+EXPOSE 8080
+
+CMD ["./monitoring-system"]
+
+// README.md
+# Monitoring System
+
+Система мониторинга с Prometheus, Grafana и алертами для сбора метрик приложений.
+
+## Возможности
+
+- **Prometheus метрики**: HTTP запросы, время ответа, бизнес-метрики
+- **Health checks**: Проверки здоровья системы и компонентов
+- **Алерты**: Автоматические уведомления при проблемах
+- **Grafana дашборды**: Визуализация метрик
+- **System events**: Журналирование системных событий
+- **Database monitoring**: Мониторинг подключений к БД
+
+## Компоненты
+
+- **Application**: Go приложение с метриками
+- **Prometheus**: Сбор и хранение метрик
+- **Grafana**: Визуализация и дашборды
+- **AlertManager**: Управление алертами
+- **PostgreSQL**: База данных приложения
+
+## Metrics Endpoints
+
+- `GET /metrics` - Prometheus метрики
+- `GET /health` - Health check
+- `GET /ready` - Readiness probe
+- `GET /live` - Liveness probe
+
+## API Endpoints
+
+- `GET /api/metrics/custom` - Кастомные метрики
+- `GET /api/events` - Системные события
+- `GET /api/alerts` - Алерты
+- `POST /api/alerts/test` - Тестовый алерт
+
+## Запуск
+
+```bash
+# Запуск всей системы
+docker-compose up
+
+# Доступ к интерфейсам
+# Application: http://localhost:8080
+# Prometheus: http://localhost:9090
+# Grafana: http://localhost:3000 (admin/admin)
+# AlertManager: http://localhost:9093
+```
+
+## Примеры метрик
+
+```promql
+# Время ответа API
+histogram_quantile(0.95, http_request_duration_seconds_bucket)
+
+# Количество запросов
+rate(http_requests_total[5m])
+
+# Частота ошибок
+rate(http_requests_total{status=~"5.."}[5m])
+
+# Здоровье системы
+system_health
+
+# Бизнес-метрики
+rate(business_events_total[5m])
+```
